@@ -1508,6 +1508,7 @@ class App(tk.Tk):
         st.configure("Treeview.Heading", background="#3a3d47", foreground=COL_TEXT,
                      borderwidth=0)
         st.map("Treeview", background=[("selected", "#4a5570")])
+        st.map("Treeview.Heading", background=[("active", "#4a4e5a")])
         for pb in ("TProgressbar", "Horizontal.TProgressbar"):
             st.configure(pb, background="#2e9e5b", troughcolor="#22242a",
                          bordercolor="#22242a", lightcolor="#2e9e5b",
@@ -1522,6 +1523,8 @@ class App(tk.Tk):
         for cb in ("TRadiobutton", "TCheckbutton"):
             st.configure(cb, background=COL_BG, foreground=COL_TEXT,
                          indicatorsize=self.px(10), indicatormargin=self.px(3))
+            # clam 기본값은 마우스를 올리면 배경이 밝아져 밝은 글씨가 묻힌다
+            st.map(cb, background=[("active", COL_PANEL)])
         # 기본 표시는 안 고른 쪽이 흰 원으로 칠해져, 어두운 화면에서 선택이 반대로 읽힌다
         st.configure("TRadiobutton", upperbordercolor=COL_MUTED, lowerbordercolor=COL_MUTED)
         st.map("TRadiobutton",
