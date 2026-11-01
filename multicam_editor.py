@@ -1070,6 +1070,16 @@ def transition_frames(idx, fps, want_sec, mode):
     return out
 
 
+def wave_index(x, width, t0, dur, hop):
+    """
+    타임라인 x 좌표에 그릴 소리 엔벌로프의 위치. 눈금(x_of)과 같은 좌표계라서 어긋나지 않는다.
+    타임라인이 소리보다 넓으면(한쪽 카메라만 찍힌 구간) 범위 밖 값이 나온다 — 음수이거나
+    엔벌로프 길이 이상이면 그 자리에는 그릴 소리가 없다.
+    """
+    t = t0 + (x - 1) / float(max(1, width - 2)) * dur
+    return int(math.floor(t / hop))
+
+
 def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
                width, height, fps_str, fps, vcodec_args, audio_cam, output,
                tmpdir=None, fade_in=0.0, fade_out=0.0,
@@ -1512,6 +1522,11 @@ class App(tk.Tk):
         for cb in ("TRadiobutton", "TCheckbutton"):
             st.configure(cb, background=COL_BG, foreground=COL_TEXT,
                          indicatorsize=self.px(10), indicatormargin=self.px(3))
+        # 기본 표시는 안 고른 쪽이 흰 원으로 칠해져, 어두운 화면에서 선택이 반대로 읽힌다
+        st.configure("TRadiobutton", upperbordercolor=COL_MUTED, lowerbordercolor=COL_MUTED)
+        st.map("TRadiobutton",
+               indicatorbackground=[("selected", COL_A), ("!selected", COL_BG)],
+               indicatorforeground=[("selected", "#ffffff")])
 
     # -- 화면 구성 ----------------------------------------------------------
 
@@ -2638,11 +2653,11 @@ class App(tk.Tk):
         env = self.env["A"]
         if env is not None and len(env) > 1:
             mx = float(env.max()) or 1.0
-            step = max(1, len(env) // max(1, W))
+            step = max(1, int(dur / self.hop_sec) // max(1, W))
             pts = []
             for x in range(W):
-                i0 = int(x / float(W) * len(env))
-                seg = env[i0:i0 + step]
+                i0 = wave_index(x, W, t0, dur, self.hop_sec)
+                seg = env[i0:i0 + step] if i0 >= 0 else env[:0]
                 v = float(seg.max()) / mx if len(seg) else 0.0
                 pts.append(v)
             for x, v in enumerate(pts):
@@ -3281,6 +3296,31 @@ def selftest():
                 ExportJob._vf_base(pf, a_clip["vf_pre"]).index("scale="))
     ok &= check("원본 크기를 안 알려줘도 동작(16:9 가정)",
                 "rotate=" in cam_vf(fine=3))
+
+    # 8) 타임라인 파형은 눈금과 맞아야 한다 (A 60초, B 70초, 시간차 +2 -> 범위 -2 ~ 68초)
+    w_lo, w_hi = union_span(cam_ranges(60.0, 70.0, 2.0))
+    w_dur, w_px, w_hop = w_hi - w_lo, 1000, 0.01
+
+    def w_x(t):
+        return int((t - w_lo) / w_dur * (w_px - 2)) + 1
+
+    def w_sec(t):
+        return wave_index(w_x(t), w_px, w_lo, w_dur, w_hop) * w_hop
+
+    ok &= check("파형: 합친 범위가 A 보다 넓은 경우", (w_lo, w_hi) == (-2.0, 68.0),
+                str((w_lo, w_hi)))
+    one_px = w_dur / (w_px - 2) + w_hop
+    ok &= check("파형: 눈금 52초 자리에 소리 52초가 그려짐", abs(w_sec(52.0) - 52.0) <= one_px,
+                "%.3f초" % w_sec(52.0))
+    ok &= check("파형: A 전 구간에서 눈금과 1픽셀 안으로 일치",
+                all(abs(w_sec(t) - t) <= one_px for t in (0.0, 8.0, 12.34, 33.3, 59.9)))
+    ok &= check("파형: A 가 시작하기 전에는 그릴 소리가 없음",
+                wave_index(w_x(-1.0), w_px, w_lo, w_dur, w_hop) < 0)
+    ok &= check("파형: A 가 끝난 뒤에는 그릴 소리가 없음",
+                wave_index(w_x(65.0), w_px, w_lo, w_dur, w_hop) >= int(60.0 / w_hop))
+    ok &= check("파형: 범위가 A 와 같으면 전체를 빠짐없이 덮음",
+                wave_index(1, 1000, 0.0, 60.0, w_hop) == 0 and
+                abs(wave_index(999, 1000, 0.0, 60.0, w_hop) - 6000) <= 1)
 
     print("\n자체 점검:", "전체 통과" if ok else "실패 있음")
     return 0 if ok else 1
