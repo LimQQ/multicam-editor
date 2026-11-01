@@ -21,6 +21,7 @@ import json
 import math
 import glob
 import shutil
+import struct
 import subprocess
 import threading
 import queue
@@ -1094,6 +1095,99 @@ INTRO_FONTS = {True: ("malgunbd.ttf", "AppleSDGothicNeo.ttc",
                False: ("malgun.ttf", "AppleSDGothicNeo.ttc",
                        "NotoSansCJK-Regular.ttc", "NanumGothic.ttf")}
 
+TITLE_FONT_DEFAULT = "기본 글꼴"    # 곡 제목 글꼴 칸의 첫 항목
+TITLE_SIZE_MIN, TITLE_SIZE_MAX = 30, 300     # 곡 제목 크기(%)
+FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc")
+NO_HANGUL_MARK = " (한글 없음)"     # 글꼴 목록에서 한글을 못 쓰는 글꼴 표시
+
+
+def font_dirs():
+    """글꼴 파일이 있는 폴더들."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        dirs = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")]
+        local = os.environ.get("LOCALAPPDATA")
+        if local:                     # '이 사용자만' 으로 설치한 글꼴
+            dirs.append(os.path.join(local, "Microsoft", "Windows", "Fonts"))
+        return dirs
+    return ["/System/Library/Fonts", "/Library/Fonts", os.path.join(home, "Library", "Fonts"),
+            "/usr/share/fonts", "/usr/local/share/fonts",
+            os.path.join(home, ".fonts"), os.path.join(home, ".local", "share", "fonts")]
+
+
+def _pick_font_name(table):
+    """글꼴의 name 표에서 전체 이름을 고른다. 한국어 -> 영어 -> 나머지 순서. 없으면 None."""
+    count, base = struct.unpack(">HH", table[2:6])
+    found = {}
+    for i in range(count):
+        plat, _, lang, nid, size, at = struct.unpack(">6H", table[6 + 12 * i:18 + 12 * i])
+        if plat == 3 and nid == 4:    # 3 = 윈도우용 기록, 4 = 전체 이름
+            found[lang] = table[base + at:base + at + size].decode("utf-16-be", "replace").strip()
+    return found.get(0x0412) or found.get(0x0409) or next(iter(found.values()), None)
+
+
+def read_font_names(path):
+    """
+    글꼴 파일에 든 글꼴들의 이름. 컬렉션(.ttc)이면 여러 개이고, 순서가 곧 글꼴 번호다.
+
+    name 표를 직접 읽는다. Pillow 는 이름을 ASCII 로만 돌려줘서 '궁서' 같은 한글 이름을
+    얻을 수 없고, 한글 이름만 있는 글꼴은 물음표가 되어 버린다.
+    """
+    with open(path, "rb") as f:
+        head = f.read(12)
+        starts = [0]
+        if head[:4] == b"ttcf":
+            n = struct.unpack(">I", head[8:12])[0]
+            starts = struct.unpack(">%dI" % n, f.read(4 * n))
+        names = []
+        for start in starts:
+            f.seek(start + 4)
+            n = struct.unpack(">H", f.read(2))[0]
+            f.seek(start + 12)
+            rows = f.read(16 * n)
+            name = None
+            for i in range(n):
+                tag, _, at, size = struct.unpack(">4sIII", rows[16 * i:16 * i + 16])
+                if tag == b"name":
+                    f.seek(at)
+                    name = _pick_font_name(f.read(size))
+                    break
+            names.append(name)
+    return names
+
+
+def list_fonts():
+    """
+    설치된 글꼴 [(표시 이름, 파일 경로, 글꼴 번호)]. 윈도우 기본 글꼴은 대부분 한글이 없어서
+    한글을 쓸 수 있는 글꼴을 앞에 모으고, 나머지 이름에는 그렇다고 표시해 둔다.
+    """
+    from PIL import ImageFont
+    found = {}
+    for root in font_dirs():
+        for folder, _, files in os.walk(root):
+            for fn in files:
+                if not fn.lower().endswith(FONT_EXTS):
+                    continue
+                path = os.path.join(folder, fn)
+                try:
+                    names = read_font_names(path)
+                except (OSError, ValueError, struct.error):
+                    continue          # 깨진 파일 하나 때문에 목록 전체를 잃지 않게
+                for i, name in enumerate(names):
+                    found.setdefault(name or os.path.splitext(fn)[0], (path, i))
+
+    rows = []
+    for name, face in found.items():
+        try:
+            ImageFont.truetype(face[0], 40, index=face[1])
+        except OSError:
+            continue                  # \uc5f4 \uc218 \uc5c6\ub294 \uae00\uaf34\uc740 \ubaa9\ub85d\uc5d0 \uc62c\ub9ac\uc9c0 \uc54a\ub294\ub2e4
+        lacks = bool(font_missing_chars(face, "\uac00"))
+        kr_name = any("\uac00" <= ch <= "\ud7a3" for ch in name)
+        rows.append(((lacks, not kr_name, name.lower()),
+                     name + (NO_HANGUL_MARK if lacks else ""), face))
+    return [(label,) + face for _, label, face in sorted(rows)]
+
 
 def intro_style(w, h):
     """
@@ -1121,8 +1215,14 @@ def intro_level(t, sec):
     return min(1.0, (sec - t) / intro_out_sec(sec))
 
 
-def _intro_font(px, bold):
+def _intro_font(px, bold, face=None):
+    """face: 사용자가 고른 글꼴 (파일 경로, 글꼴 번호). 못 열면 기본 글꼴을 쓴다."""
     from PIL import ImageFont
+    if face:
+        try:
+            return ImageFont.truetype(face[0], max(8, int(px)), index=face[1])
+        except OSError:
+            pass
     for name in INTRO_FONTS[bold]:
         try:
             return ImageFont.truetype(name, max(8, int(px)))
@@ -1131,12 +1231,33 @@ def _intro_font(px, bold):
     return ImageFont.load_default()
 
 
-def _fit_text(text, px, bold, max_w):
+def font_missing_chars(face, text):
+    """
+    이 글꼴에 없는 글자들. Pillow 는 없는 글자를 다른 글꼴로 대신 그려 주지 않고 네모로
+    그리므로, 어느 글꼴에도 없는 코드와 모양이 같은지 비교해서 찾는다.
+    """
+    from PIL import Image, ImageDraw
+    font = _intro_font(40, True, face)
+
+    def shape(ch):
+        im = Image.new("L", (96, 96))
+        try:
+            ImageDraw.Draw(im).text((16, 16), ch, font=font, fill=255)
+        except OSError:               # 망가진 글꼴은 그리는 단계에서 실패한다 — 없는 글자로 친다
+            return None
+        return im.tobytes()
+
+    blank = shape("\U0010ffff")
+    return sorted(set(c for c in (text or "")
+                      if not c.isspace() and shape(c) in (None, blank)))
+
+
+def _fit_text(text, px, bold, max_w, face=None):
     """폭 안에 들어가도록 글자를 조금 줄이고, 그래도 넘치면 줄을 바꾼다. (글꼴, 줄 목록)"""
     low = px * 0.6
     size = px
     while True:
-        font = _intro_font(size, bold)
+        font = _intro_font(size, bold, face)
         if font.getlength(text) <= max_w:
             return font, [text]
         if size <= low:
@@ -1162,16 +1283,23 @@ def _fit_text(text, px, bold, max_w):
     return font, lines
 
 
-def render_intro_layer(w, h, title, composer):
-    """곡 제목·작곡가만 그린 투명 그림(RGBA). 내보내기와 미리보기가 같은 그림을 쓴다."""
+def render_intro_layer(w, h, title, composer, face=None, scale=1.0):
+    """
+    곡 제목·작곡가만 그린 투명 그림(RGBA). 내보내기와 미리보기가 같은 그림을 쓴다.
+
+    face, scale 은 곡 제목에만 적용한다. 고른 글꼴에 없는 글자가 있으면 그 글자가 네모로
+    나오므로 곡 제목 전체를 기본 글꼴로 그린다 (알림은 화면 쪽에서 띄운다).
+    """
     from PIL import Image, ImageDraw, ImageFilter
     st = intro_style(w, h)
+    if face and font_missing_chars(face, title):
+        face = None
     blocks = []
-    for text, px, bold, alpha in ((title, st["title_px"], True, 255),
-                                  (composer, st["composer_px"], False, 235)):
+    for text, px, bold, alpha, chosen in ((title, st["title_px"] * scale, True, 255, face),
+                                          (composer, st["composer_px"], False, 235, None)):
         text = (text or "").strip()
         if text:
-            font, lines = _fit_text(text, px, bold, st["max_w"])
+            font, lines = _fit_text(text, px, bold, st["max_w"], chosen)
             blocks.append((font, lines, int(getattr(font, "size", px) * 1.3), alpha))
 
     total = sum(len(lines) * lh for _, lines, lh, _ in blocks)
@@ -1302,7 +1430,9 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
         if n > 0:
             head_item = dict(first, kind="intro", frames=n, label="제목 인트로",
                              title=intro.get("title", ""),
-                             composer=intro.get("composer", ""))
+                             composer=intro.get("composer", ""),
+                             title_font=intro.get("font"),
+                             title_scale=intro.get("scale", 1.0))
             if n < first["frames"]:
                 head_item.pop("fade_out", None)
                 body = dict(first, frames=first["frames"] - n,
@@ -1451,7 +1581,8 @@ class ExportJob(object):
             # 있고, 글꼴 경로와 특수문자(콜론, 따옴표) 이스케이프도 까다롭다.
             layer = os.path.join(p["tmpdir"], "intro_%04d.png" % idx)
             render_intro_layer(p["width"], p["height"],
-                               seg.get("title", ""), seg.get("composer", "")).save(layer)
+                               seg.get("title", ""), seg.get("composer", ""),
+                               seg.get("title_font"), seg.get("title_scale", 1.0)).save(layer)
             fc = intro_graph(base, p["width"], p["height"], dur,
                              seg.get("fade_in", 0.0), seg.get("fade_out", 0.0))
             cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -1619,6 +1750,9 @@ class App(tk.Tk):
         self._intro_after = None     # 제목 입력을 몰아서 반영하기 위한 예약
         self._intro_cache = None     # 미리보기용 글자 그림
         self._intro_buf = None       # 재생 중 인트로를 마지막으로 입힌 프레임
+        self._font_map = {}          # 글꼴 칸에 보이는 이름 -> (파일 경로, 글꼴 번호)
+        self._fonts_asked = False    # 설치된 글꼴을 읽기 시작했는지
+        self._font_warned = False    # 상태줄에 '글꼴에 없는 글자' 안내를 띄워 둔 상태
 
         self.workers = {
             "A": FrameWorker(self.ff, lambda tok, img: self._uiq.put(("frame", "A", tok, img))),
@@ -1726,6 +1860,9 @@ class App(tk.Tk):
         st.configure("Mode.Toolbutton", background="#3a3d47", foreground=COL_TEXT,
                      padding=(self.px(12), self.px(5)), anchor="center", borderwidth=0)
         st.map("Mode.Toolbutton", background=[("selected", COL_A), ("active", "#4a4e5a")])
+        # 글꼴 칸은 좁은데 이름은 길다. 펼친 목록만 넓히되, 칸이 창 오른쪽 끝에 있어서
+        # 화면 밖으로 나가지 않도록 왼쪽으로 늘린다.
+        st.configure("Font.TCombobox", postoffset=(-self.px(190), 0, self.px(190), 0))
 
     # -- 화면 구성 ----------------------------------------------------------
 
@@ -2049,15 +2186,34 @@ class App(tk.Tk):
         self.var_title = tk.StringVar()
         self.var_composer = tk.StringVar()
         self.var_intro_sec = tk.StringVar(value="%.1f" % INTRO_SEC)
-        for i, (txt, var) in enumerate((("곡 제목", self.var_title),
-                                        ("작곡가", self.var_composer))):
+        for i, txt, var in ((0, "곡 제목", self.var_title), (2, "작곡가", self.var_composer)):
             ttk.Label(introbox, text=txt).grid(row=i, column=0, sticky="w", pady=P(1))
             ie = ttk.Entry(introbox, textvariable=var)
             ie.grid(row=i, column=1, sticky="ew", padx=(P(6), 0), pady=P(1))
             ie.bind("<Return>", lambda ev: self.focus_set())
             var.trace_add("write", lambda *a: self.on_intro())
+
+        # 곡 제목 글꼴 — 목록은 싱글캠에 처음 들어올 때 뒤에서 읽어 채운다 (_load_font_list)
+        ttk.Label(introbox, text="글꼴").grid(row=1, column=0, sticky="w", pady=P(1))
+        fr = ttk.Frame(introbox)
+        fr.grid(row=1, column=1, sticky="ew", padx=(P(6), 0), pady=P(1))
+        fr.columnconfigure(0, weight=1)
+        self.var_font = tk.StringVar(value=TITLE_FONT_DEFAULT)
+        self._cb_font = ttk.Combobox(fr, textvariable=self.var_font, state="readonly",
+                                     style="Font.TCombobox",
+                                     values=[TITLE_FONT_DEFAULT], width=14, height=18)
+        self._cb_font.grid(row=0, column=0, sticky="ew")
+        self._cb_font.bind("<<ComboboxSelected>>", lambda ev: self.focus_set())
+        self.var_font.trace_add("write", lambda *a: self.on_intro())
+        ttk.Label(fr, text="크기", style="Muted.TLabel").grid(row=0, column=1, padx=(P(6), P(3)))
+        self.var_title_size = tk.StringVar(value="100")
+        ttk.Spinbox(fr, from_=TITLE_SIZE_MIN, to=TITLE_SIZE_MAX, increment=10, width=4,
+                    textvariable=self.var_title_size, command=self.on_intro).grid(row=0, column=2)
+        ttk.Label(fr, text="%", style="Muted.TLabel").grid(row=0, column=3, padx=(P(2), 0))
+        self.var_title_size.trace_add("write", lambda *a: self.on_intro())
+
         ir = ttk.Frame(introbox)
-        ir.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(P(5), 0))
+        ir.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(P(5), 0))
         ttk.Checkbutton(ir, text="넣기", variable=self.var_intro,
                         command=self.on_intro).pack(side="left")
         ttk.Label(ir, text="길이", style="Muted.TLabel").pack(side="left", padx=(P(8), P(3)))
@@ -2305,6 +2461,7 @@ class App(tk.Tk):
         self._adj_box.configure(text="화면 보정" if single else "화면 보정 (카메라별)")
 
         if single:
+            self._load_font_list()
             self.file_box["B"].grid_remove()
             self.file_box["A"].grid(columnspan=2, padx=0)
             self._sync_row.pack_forget()
@@ -2460,7 +2617,7 @@ class App(tk.Tk):
     # -- 곡 제목 인트로 (싱글캠) ------------------------------------------------
 
     def intro_settings(self):
-        """인트로를 넣을 거면 {'title', 'composer', 'sec'}, 아니면 None."""
+        """인트로를 넣을 거면 {'title', 'composer', 'sec', 'font', 'scale'}, 아니면 None."""
         if not (self.single and self.var_intro.get()):
             return None
         title = self.var_title.get().strip()
@@ -2468,8 +2625,57 @@ class App(tk.Tk):
         if not (title or composer):
             return None
         sec = self._fnum(self.var_intro_sec, INTRO_SEC)
+        size = self._fnum(self.var_title_size, 100.0)
         return {"title": title, "composer": composer,
-                "sec": max(INTRO_SEC_MIN, min(INTRO_SEC_MAX, sec))}
+                "sec": max(INTRO_SEC_MIN, min(INTRO_SEC_MAX, sec)),
+                "font": self._font_map.get(self.var_font.get()),
+                "scale": max(TITLE_SIZE_MIN, min(TITLE_SIZE_MAX, size)) / 100.0}
+
+    def _load_font_list(self):
+        """설치된 글꼴을 한 번만, 화면을 막지 않게 뒤에서 읽는다."""
+        if self._fonts_asked:
+            return
+        self._fonts_asked = True
+
+        def work():
+            try:
+                fonts = list_fonts()
+            except Exception:
+                traceback.print_exc()
+                fonts = []
+            self._uiq.put(("fonts", fonts))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_fonts(self, fonts):
+        names = [TITLE_FONT_DEFAULT]
+        for name, path, index in fonts:
+            self._font_map.setdefault(name, (path, index))
+            names.append(name)
+        chosen = self.var_font.get()
+        if chosen not in names:       # 프로젝트에서 불러온, 지금은 목록에 없는 글꼴
+            names.insert(1, chosen)
+        self._cb_font.configure(values=names)
+
+    def _restore_font(self, saved):
+        """프로젝트에 저장된 글꼴을 되살린다. 파일을 찾지 못하면 기본 글꼴로 두고 False."""
+        if saved and os.path.exists(saved[1]):
+            self._font_map[saved[0]] = (saved[1], int(saved[2]))
+            self.var_font.set(saved[0])
+            return True
+        self.var_font.set(TITLE_FONT_DEFAULT)
+        return not saved
+
+    def _check_title_font(self):
+        """고른 글꼴에 제목 글자가 없어 기본 글꼴로 나갈 때 그 이유를 상태줄에 알린다."""
+        iv = self.intro_settings()
+        lack = font_missing_chars(iv["font"], iv["title"]) if iv and iv["font"] else []
+        if lack:
+            self.prog_lbl.configure(text="이 글꼴에 없는 글자가 있어 곡 제목은 기본 글꼴로 나갑니다: "
+                                         + " ".join(lack[:8]))
+        elif self._font_warned:
+            self.prog_lbl.configure(text="")
+        self._font_warned = bool(lack)
 
     def on_intro(self, *a):
         """글자를 칠 때마다 다시 그리지 않도록 잠깐 모아서 반영."""
@@ -2480,6 +2686,7 @@ class App(tk.Tk):
 
     def _apply_intro_change(self):
         self._intro_after = None
+        self._check_title_font()
         if self._playing or not self.ready:
             return
         # 고친 결과가 바로 보이도록 인트로가 안 보이는 위치면 그 자리로 옮긴다
@@ -2508,10 +2715,10 @@ class App(tk.Tk):
     def _intro_letters(self, iv, w, h):
         """글자 그림에서 글자가 있는 부분만 오려 둔다. (색, 투명도, 위치)
         재생 중에는 매 프레임 쓰므로 내용과 크기가 그대로면 다시 그리지 않는다."""
-        key = (iv["title"], iv["composer"], w, h)
+        key = (iv["title"], iv["composer"], w, h, iv["font"], iv["scale"])
         if self._intro_cache and self._intro_cache[0] == key:
             return self._intro_cache[1]
-        layer = render_intro_layer(w, h, iv["title"], iv["composer"])
+        layer = render_intro_layer(w, h, iv["title"], iv["composer"], iv["font"], iv["scale"])
         box = layer.getchannel("A").getbbox() or (0, 0, 1, 1)
         cut = layer.crop(box)
         made = (cut.convert("RGB"), cut.getchannel("A"), (box[0], box[1]))
@@ -2830,7 +3037,9 @@ class App(tk.Tk):
             return
         if self.single and not self._export:
             self.prog["value"] = 0
-            self.prog_lbl.configure(text=TRIM_HINT)
+            self._check_title_font()  # 분석 문구가 덮어쓴 글꼴 안내가 있으면 되살린다
+            if not self._font_warned:
+                self.prog_lbl.configure(text=TRIM_HINT)
         if env is not None and len(env) > 1:
             self.env["A"] = env
             self.redraw_timeline()
@@ -3643,6 +3852,7 @@ class App(tk.Tk):
             filetypes=[("멀티캠 프로젝트", "*.mcp")])
         if not path:
             return
+        face = self._font_map.get(self.var_font.get())
         data = {
             "version": VERSION,
             "mode": self.mode,
@@ -3661,7 +3871,9 @@ class App(tk.Tk):
             "intro": {"on": bool(self.var_intro.get()),
                       "title": self.var_title.get(),
                       "composer": self.var_composer.get(),
-                      "sec": self._fnum(self.var_intro_sec, INTRO_SEC)},
+                      "sec": self._fnum(self.var_intro_sec, INTRO_SEC),
+                      "font": ([self.var_font.get()] + list(face)) if face else None,
+                      "title_size": self._fnum(self.var_title_size, 100.0)},
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3724,6 +3936,8 @@ class App(tk.Tk):
             self.var_title.set(iv.get("title", ""))
             self.var_composer.set(iv.get("composer", ""))
             self.var_intro_sec.set("%.1f" % float(iv.get("sec", INTRO_SEC)))
+            self.var_title_size.set("%g" % float(iv.get("title_size", 100.0)))
+            font_ok = self._restore_font(iv.get("font"))
             self.env = {"A": None, "B": None}
             if self.single:
                 self._start_wave()
@@ -3731,6 +3945,9 @@ class App(tk.Tk):
             self.seek(self.trim_start)
             self.update_ui()
             self.prog_lbl.configure(text="프로젝트 불러옴: " + os.path.basename(path))
+            if not font_ok:           # 상태줄은 파형 분석 문구에 곧 덮이므로 대화상자로 알린다
+                messagebox.showwarning(APP_TITLE, "저장된 글꼴을 찾을 수 없어 기본 글꼴로 바꿨습니다:\n"
+                                       + str(iv["font"][0]))
         except Exception as e:
             messagebox.showerror(APP_TITLE, "불러오기 실패:\n" + str(e))
 
@@ -3753,6 +3970,8 @@ class App(tk.Tk):
             self._on_wave_prog(msg[1], msg[2])
         elif kind == "wave":
             self._on_wave(msg[1], msg[2])
+        elif kind == "fonts":
+            self._on_fonts(msg[1])
 
     def _pump(self):
         # 한 건이 실패해도 나머지를 계속 처리하고, 무슨 일이 있어도 다음 차례를
@@ -4157,6 +4376,8 @@ def selftest():
     ok &= check("세로 화면에서도 폭 안에 들어감", bv[0] > 0 and bv[2] < 1080, str(bv))
 
     # 9) 인트로 실제 변환 — 필터 그래프는 ffmpeg 이 직접 돌려 봐야 안다
+    fonts = list_fonts()
+    kr_face = fonts[0][1:] if fonts and not fonts[0][0].endswith(NO_HANGUL_MARK) else None
     ff_, fp_ = find_tool("ffmpeg"), find_tool("ffprobe")
     if ff_ and fp_:
         import tempfile
@@ -4173,7 +4394,8 @@ def selftest():
             real = build_plan(compute_segments(1.0, 6.0, [], "A"), src, None, 0.0, 1.0, 6.0,
                               320, 180, "30", 30.0, vargs, "A", out,
                               tmpdir=os.path.join(work, "tmp"), fade_in=0.5, fade_out=0.5,
-                              intro={"title": "테스트: '곡' 100%", "composer": "작곡가", "sec": 2.0})
+                              intro={"title": "테스트: '곡' 100%", "composer": "작곡가", "sec": 2.0,
+                                     "font": kr_face, "scale": 1.2})
             result = []
             ExportJob(ff_, real, lambda f, m: None,
                       lambda good, msg: result.append((good, msg)))._run()
@@ -4223,6 +4445,58 @@ def selftest():
     ok &= check("파형: 범위가 A 와 같으면 전체를 빠짐없이 덮음",
                 wave_index(1, 1000, 0.0, 60.0, w_hop) == 0 and
                 abs(wave_index(999, 1000, 0.0, 60.0, w_hop) - 6000) <= 1)
+
+    # 11) 곡 제목 글꼴과 크기
+    p_font = solo_plan(solo, 12.0, 102.0, dict(iv, font=("x.ttf", 2), scale=1.5))
+    ok &= check("계획에 곡 제목 글꼴과 크기가 실림",
+                p_font["segments"][0]["title_font"] == ("x.ttf", 2) and
+                p_font["segments"][0]["title_scale"] == 1.5)
+    ok &= check("인트로 뒤 본편에는 글꼴 정보가 없어도 됨",
+                "title_font" not in p_font["segments"][1])
+
+    def layer_bytes(*args):
+        return render_intro_layer(*args).tobytes()
+
+    base_l = layer_bytes(640, 360, "Title", "작곡가")
+    ok &= check("글꼴 파일이 없으면 기본 글꼴로 그림",
+                layer_bytes(640, 360, "Title", "작곡가", ("없는파일.ttf", 0)) == base_l)
+    s1 = letters_box(1280, 720, "Title", "")
+    s2 = letters_box(1280, 720, "Title", "", None, 1.5)
+    ok &= check("크기를 키우면 곡 제목이 커짐", (s2[2] - s2[0]) > (s1[2] - s1[0]) * 1.3,
+                "%d -> %d픽셀" % (s1[2] - s1[0], s2[2] - s2[0]))
+    s3 = letters_box(1280, 720, "아주 긴 곡 제목 " * 12, "", None, 3.0)
+    ok &= check("크게 키워도 화면 폭을 넘지 않음", s3[0] > 0 and s3[2] < 1280, str(s3))
+    ok &= check("크기는 작곡가에 영향 없음",
+                layer_bytes(640, 360, "", "작곡가", None, 2.0) == layer_bytes(640, 360, "", "작곡가"))
+
+    win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    malgun, arial = os.path.join(win, "malgun.ttf"), os.path.join(win, "arial.ttf")
+    if os.path.exists(malgun) and os.path.exists(arial):
+        ok &= check("글꼴 파일에서 한글 이름을 읽음", read_font_names(malgun) == ["맑은 고딕"],
+                    str(read_font_names(malgun)))
+        ok &= check("컬렉션(.ttc)의 글꼴을 모두 읽음",
+                    len(read_font_names(os.path.join(win, "gulim.ttc"))) >= 2
+                    if os.path.exists(os.path.join(win, "gulim.ttc")) else True)
+        labels = [f[0] for f in fonts]
+        ok &= check("글꼴 목록: 한글 쓸 수 있는 글꼴이 앞", "맑은 고딕" in labels and
+                    labels.index("맑은 고딕") < labels.index("Arial" + NO_HANGUL_MARK),
+                    "%d개 중 앞부분 %s" % (len(labels), labels[:3]))
+        ok &= check("글꼴 목록: 표시 이름이 겹치지 않음", len(set(labels)) == len(labels))
+        ok &= check("한글 없는 글꼴을 찾아냄", font_missing_chars((arial, 0), "가A") == ["가"],
+                    str(font_missing_chars((arial, 0), "가A")))
+        ok &= check("있는 글자는 없다고 하지 않음", font_missing_chars((arial, 0), "Title 1!") == [])
+        ok &= check("한글 글꼴은 한글이 있다고 판별", font_missing_chars((malgun, 0), "곡 제목") == [])
+        ok &= check("영문 제목은 고른 글꼴로 그림",
+                    layer_bytes(640, 360, "Title", "", (arial, 0)) !=
+                    layer_bytes(640, 360, "Title", ""))
+        ok &= check("한글 제목에 영문 글꼴을 고르면 기본 글꼴로 그림 (네모 방지)",
+                    layer_bytes(640, 360, "곡 제목", "", (arial, 0)) ==
+                    layer_bytes(640, 360, "곡 제목", ""))
+        ok &= check("작곡가는 고른 글꼴의 영향을 받지 않음",
+                    layer_bytes(640, 360, "", "작곡가", (arial, 0)) ==
+                    layer_bytes(640, 360, "", "작곡가"))
+    else:
+        print("  건너뜀  곡 제목 글꼴 (윈도우 기본 글꼴 없음)")
 
     print("\n자체 점검:", "전체 통과" if ok else "실패 있음")
     return 0 if ok else 1
