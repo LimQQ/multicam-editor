@@ -7,6 +7,10 @@
   - 사용자가 원하는 위치에서 카메라 A / B 전환
   - 앞뒤 잘라내기(트리밍)
 
+카메라가 한 대뿐이면 싱글캠 모드로 편집합니다.
+  - 곡이 아닌 앞뒤 부분을 직접 잘라내기
+  - (선택) 첫머리에 배경 블러 + 곡 제목 / 작곡가 자막
+
 필요: Python 3.9+, numpy, pillow, ffmpeg/ffprobe
 """
 
@@ -25,7 +29,7 @@ import traceback
 from io import BytesIO
 
 APP_TITLE = "밴드 멀티캠 편집기"
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ----------------------------------------------------------------------------
 # 외부 프로그램(ffmpeg) 찾기
@@ -1070,10 +1074,150 @@ def transition_frames(idx, fps, want_sec, mode):
     return out
 
 
+# 제목 인트로 (싱글캠 — 영상 첫머리: 배경 블러 + 가운데 곡 제목 / 작곡가)
+INTRO_SEC = 3.0                   # 기본 길이(초)
+INTRO_SEC_MIN, INTRO_SEC_MAX = 1.0, 10.0
+INTRO_OUT = 0.6                   # 끝에서 글자와 블러가 함께 걷히는 시간(초)
+
+INTRO_FONTS = {True: ("malgunbd.ttf", "AppleSDGothicNeo.ttc",
+                      "NotoSansCJK-Bold.ttc", "NanumGothicBold.ttf"),
+               False: ("malgun.ttf", "AppleSDGothicNeo.ttc",
+                       "NotoSansCJK-Regular.ttc", "NanumGothic.ttf")}
+
+
+def intro_style(w, h):
+    """
+    인트로 화면의 느낌을 정하는 값들. 전부 출력 화면 크기에 비례하므로
+    해상도가 달라도, 세로 영상이어도 같은 모양이 된다.
+    """
+    base = float(min(w, h))
+    return {"title_px": base * 0.095,      # 곡 제목 글자 크기
+            "composer_px": base * 0.048,   # 작곡가 글자 크기
+            "gap_px": base * 0.03,         # 제목과 작곡가 사이 간격
+            "max_w": w * 0.86,             # 이 폭을 넘으면 글자를 줄이거나 줄을 바꾼다
+            "blur": base * 0.02,           # 배경 블러 세기(시그마)
+            "dim": 0.72}                   # 배경 밝기 (1 이면 그대로, 작을수록 어둡게)
+
+
+def intro_out_sec(sec):
+    """글자와 블러가 걷히는 시간. 짧은 인트로에서는 전체의 1/3 까지만 쓴다."""
+    return min(INTRO_OUT, sec / 3.0)
+
+
+def intro_level(t, sec):
+    """인트로 시작 후 t초 시점의 세기 (1 = 블러·글자 온전히, 0 = 인트로 끝남)."""
+    if t < -1e-9 or t >= sec:
+        return 0.0
+    return min(1.0, (sec - t) / intro_out_sec(sec))
+
+
+def _intro_font(px, bold):
+    from PIL import ImageFont
+    for name in INTRO_FONTS[bold]:
+        try:
+            return ImageFont.truetype(name, max(8, int(px)))
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _fit_text(text, px, bold, max_w):
+    """폭 안에 들어가도록 글자를 조금 줄이고, 그래도 넘치면 줄을 바꾼다. (글꼴, 줄 목록)"""
+    low = px * 0.6
+    size = px
+    while True:
+        font = _intro_font(size, bold)
+        if font.getlength(text) <= max_w:
+            return font, [text]
+        if size <= low:
+            break
+        size = max(low, size * 0.92)
+
+    lines, cur = [], ""
+    for word in text.split():
+        joined = (cur + " " + word) if cur else word
+        if font.getlength(joined) <= max_w:
+            cur = joined
+            continue
+        if cur:
+            lines.append(cur)
+            cur = ""
+        for ch in word:               # 한 단어가 폭보다 길면 글자 단위로 끊는다
+            if cur and font.getlength(cur + ch) > max_w:
+                lines.append(cur)
+                cur = ""
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return font, lines
+
+
+def render_intro_layer(w, h, title, composer):
+    """곡 제목·작곡가만 그린 투명 그림(RGBA). 내보내기와 미리보기가 같은 그림을 쓴다."""
+    from PIL import Image, ImageDraw, ImageFilter
+    st = intro_style(w, h)
+    blocks = []
+    for text, px, bold, alpha in ((title, st["title_px"], True, 255),
+                                  (composer, st["composer_px"], False, 235)):
+        text = (text or "").strip()
+        if text:
+            font, lines = _fit_text(text, px, bold, st["max_w"])
+            blocks.append((font, lines, int(getattr(font, "size", px) * 1.3), alpha))
+
+    total = sum(len(lines) * lh for _, lines, lh, _ in blocks)
+    total += st["gap_px"] * max(0, len(blocks) - 1)
+    y = (h - total) / 2.0
+
+    # 밝은 배경에서도 글자가 읽히도록 흐린 그림자를 깐다
+    letters = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    dl, ds = ImageDraw.Draw(letters), ImageDraw.Draw(shadow)
+    off = max(1, int(st["title_px"] * 0.03))
+    for font, lines, lh, alpha in blocks:
+        for line in lines:
+            mid = y + lh / 2.0
+            ds.text((w / 2.0 + off, mid + off), line, font=font,
+                    fill=(0, 0, 0, 190), anchor="mm")
+            dl.text((w / 2.0, mid), line, font=font,
+                    fill=(255, 255, 255, alpha), anchor="mm")
+            y += lh
+        y += st["gap_px"]
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(1.0, st["title_px"] * 0.06)))
+    return Image.alpha_composite(shadow, letters)
+
+
+def intro_graph(base, w, h, sec, fade_in=0.0, fade_out=0.0):
+    """
+    인트로 조각의 필터 그래프. 입력 0 = 원본 영상, 입력 1 = 글자 그림.
+
+    블러 화면을 원본 위에 겹쳐 두었다가 끝에서 투명하게 만드는 방식이라,
+    블러가 서서히 풀리며 글자도 같이 사라진다. 검정 페이드는 맨 마지막에 걸어
+    화면 전체(글자 포함)가 함께 밝아지고 어두워지게 한다.
+    """
+    st = intro_style(w, h)
+    d = intro_out_sec(sec)
+    at = max(0.0, sec - d)
+    k = st["dim"]
+    dim = "lutyuv=y=16+(val-16)*%.3f:u=128+(val-128)*%.3f:v=128+(val-128)*%.3f" % (k, k, k)
+    end = ""
+    if fade_in > 0:
+        end += "fade=t=in:st=0:d=%.6f," % fade_in
+    if fade_out > 0:
+        end += "fade=t=out:st=%.6f:d=%.6f," % (max(0.0, sec - fade_out), fade_out)
+    return ("[0:v]%s,setpts=PTS-STARTPTS,split[sharp][soft];"
+            "[soft]gblur=sigma=%.3f,%s,format=yuva420p,"
+            "fade=t=out:st=%.6f:d=%.6f:alpha=1[blur];"
+            "[1:v]format=rgba,fade=t=out:st=%.6f:d=%.6f:alpha=1[text];"
+            "[sharp][blur]overlay=format=yuv420[bg];"
+            "[bg][text]overlay=format=yuv420,%sformat=yuv420p[v]"
+            % (base, st["blur"], dim, at, d, at, d, end))
+
+
 def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
                width, height, fps_str, fps, vcodec_args, audio_cam, output,
                tmpdir=None, fade_in=0.0, fade_out=0.0,
-               trans_mode="none", trans_sec=0.0, adjust=None, sizes=None):
+               trans_mode="none", trans_sec=0.0, adjust=None, sizes=None,
+               intro=None):
     """
     내보내기 작업 명세를 만든다. B 카메라 시간 = A 시간 + offset.
 
@@ -1082,6 +1226,7 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
     trans_sec  : 전환 길이(초)
     adjust     : 카메라별 화면 보정 {'A': {'rot':0,'fine':0,'sharp':0.0,'sat':1.0}, ...}
     sizes      : 카메라별 원본 크기 {'A': (가로, 세로), ...} — 미세 각도 확대율 계산용
+    intro      : 제목 인트로 {'title':..., 'composer':..., 'sec':...} 또는 None
     """
     paths = {"A": path_a, "B": path_b}
     sizes = sizes or {}
@@ -1115,6 +1260,8 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
         item = {"kind": "clip", "path": paths[cam], "cam": cam,
                 "src_start": src_time(cam, f0), "frames": f1 - f0,
                 "vf_pre": pre[cam]}
+        if path_b is None:                 # 싱글캠 — 카메라 이름을 보일 필요가 없다
+            item["label"] = "영상"
         if trans_mode == "black":
             # 장면 안에서 어두워졌다 밝아지게 (앞뒤로 나눠 가진 길이만큼)
             if tail[i]:
@@ -1137,6 +1284,24 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
 
     total_frames = idx[-1] - idx[0]
 
+    # 제목 인트로 — 첫 장면의 앞부분을 별도 조각으로 떼어 낸다. 시간을 끼워 넣는 게
+    # 아니라 그 구간의 화면만 바꾸는 것이므로 전체 길이와 소리 위치는 그대로다.
+    if intro and items and items[0]["kind"] == "clip":
+        first = items[0]
+        n = min(int(round(intro["sec"] * fps)), first["frames"])
+        if n > 0:
+            head_item = dict(first, kind="intro", frames=n, label="제목 인트로",
+                             title=intro.get("title", ""),
+                             composer=intro.get("composer", ""))
+            if n < first["frames"]:
+                head_item.pop("fade_out", None)
+                body = dict(first, frames=first["frames"] - n,
+                            src_start=first["src_start"] + n / float(fps))
+                body.pop("fade_in", None)
+                items[0:1] = [head_item, body]
+            else:
+                items[0] = head_item
+
     # 시작/끝 검정 페이드 — 첫/마지막 조각 안에서 처리
     if fade_in > 0 and items:
         d = min(fade_in, items[0]["frames"] / float(fps))
@@ -1148,6 +1313,10 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
             items[-1]["fade_out"] = max(items[-1].get("fade_out", 0.0), d)
 
     a_off = offset if audio_cam == "B" else 0.0
+    a_fade_in = max(0.0, fade_in)
+    if items and items[0]["kind"] == "intro":
+        # 영상 페이드가 인트로 길이로 잘렸으면 소리도 같은 길이로 맞춘다
+        a_fade_in = min(a_fade_in, items[0]["frames"] / float(fps))
     return {
         "segments": items,
         "width": (width // 2) * 2, "height": (height // 2) * 2,
@@ -1155,7 +1324,7 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
         "vcodec_args": list(vcodec_args),
         "audio_path": paths[audio_cam],
         "audio_start": max(0.0, trim_start + a_off),
-        "audio_fade_in": max(0.0, fade_in),
+        "audio_fade_in": a_fade_in,
         "audio_fade_out": max(0.0, fade_out),
         "total_duration": total_frames / float(fps),
         "output": output,
@@ -1267,7 +1436,21 @@ class ExportJob(object):
         base = self._vf_base(p, seg.get("vf_pre", ""))
         dur = seg["frames"] / _fps_value(p["fps_str"])
 
-        if seg.get("kind") == "dissolve":
+        if seg.get("kind") == "intro":
+            # 글자는 그림으로 그려 얹는다. drawtext 필터는 ffmpeg 빌드에 따라 없을 수
+            # 있고, 글꼴 경로와 특수문자(콜론, 따옴표) 이스케이프도 까다롭다.
+            layer = os.path.join(p["tmpdir"], "intro_%04d.png" % idx)
+            render_intro_layer(p["width"], p["height"],
+                               seg.get("title", ""), seg.get("composer", "")).save(layer)
+            fc = intro_graph(base, p["width"], p["height"], dur,
+                             seg.get("fade_in", 0.0), seg.get("fade_out", 0.0))
+            cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                   "-ss", "%.6f" % seg["src_start"], "-i", seg["path"],
+                   "-loop", "1", "-framerate", p["fps_str"],
+                   "-t", "%.6f" % (dur + 1.0), "-i", layer,
+                   "-filter_complex", fc, "-map", "[v]",
+                   "-an", "-frames:v", str(seg["frames"])]
+        elif seg.get("kind") == "dissolve":
             # 두 카메라를 같은 순간에서 각각 읽어와 겹쳐 넘긴다
             # (카메라마다 보정이 다를 수 있으므로 각자 다른 필터를 태운다)
             base2 = self._vf_base(p, seg.get("vf_pre2", ""))
@@ -1309,8 +1492,9 @@ class ExportJob(object):
                 except ValueError:
                     seg_done = 0
                 frac = 0.90 * (done_frames + min(seg_done, seg["frames"])) / float(total_frames)
-                self.on_progress(frac, "장면 %d/%d 변환 중 (카메라 %s)"
-                                 % (idx + 1, count, seg["cam"]))
+                self.on_progress(frac, "장면 %d/%d 변환 중 (%s)"
+                                 % (idx + 1, count,
+                                    seg.get("label") or "카메라 %s" % seg["cam"]))
         err = self.proc.stderr.read().decode("utf-8", "replace")
         self.proc.stdout.close()
         self.proc.stderr.close()
@@ -1353,6 +1537,10 @@ TRANS_LABELS = [t[0] for t in TRANS_MODES]
 TRANS_BY_LABEL = dict(TRANS_MODES)
 TRANS_BY_MODE = dict((m, l) for l, m in TRANS_MODES)
 
+# 해상도/프레임 칸의 '원본에 맞추기' 항목. 싱글캠에는 A/B 구분이 없다.
+SAME_LABEL = {"multi": "A 영상과 동일", "single": "원본과 동일"}
+TRIM_HINT = "곡이 시작하는 곳에서 I, 끝나는 곳에서 O 를 누르세요. 타임라인의 초록 선을 끌어도 됩니다."
+
 
 class App(tk.Tk):
     def __init__(self, ffmpeg, ffprobe, np):
@@ -1384,6 +1572,7 @@ class App(tk.Tk):
         self.configure(bg=COL_BG)
 
         # 상태
+        self.mode = "multi"          # "multi" = 카메라 2대, "single" = 카메라 1대
         self.info = {"A": None, "B": None}
         self.offset = 0.0            # B_시간 = A_시간 + offset
         self.sync_conf = None
@@ -1414,6 +1603,12 @@ class App(tk.Tk):
         self._adj_after = None       # 화면 보정 값 변경을 몰아서 반영하기 위한 예약
         self._matching = False       # 두 화면 맞추기 분석 중
         self._can_expose = self._has_filter("exposure")
+        self._wave_token = 0         # 싱글캠 파형 분석 — 다른 영상을 열면 옛 결과를 버린다
+        self._play_tail = False      # 끝점 뒤(잘려나갈 부분)를 듣는 중
+        self._tl_drag = None         # 타임라인에서 끌고 있는 손잡이 ('in' / 'out')
+        self._intro_after = None     # 제목 입력을 몰아서 반영하기 위한 예약
+        self._intro_cache = None     # 미리보기용 글자 그림
+        self._intro_buf = None       # 재생 중 인트로를 마지막으로 입힌 프레임
 
         self.workers = {
             "A": FrameWorker(self.ff, lambda tok, img: self._uiq.put(("frame", "A", tok, img))),
@@ -1512,6 +1707,11 @@ class App(tk.Tk):
         for cb in ("TRadiobutton", "TCheckbutton"):
             st.configure(cb, background=COL_BG, foreground=COL_TEXT,
                          indicatorsize=self.px(10), indicatormargin=self.px(3))
+        # 편집 모드 선택은 눌린 쪽이 한눈에 보여야 한다 (기본 라디오는 어두운 화면에서
+        # 안 고른 쪽이 흰 원으로 칠해져 오히려 고른 것처럼 보인다)
+        st.configure("Mode.Toolbutton", background="#3a3d47", foreground=COL_TEXT,
+                     padding=(self.px(12), self.px(5)), anchor="center", borderwidth=0)
+        st.map("Mode.Toolbutton", background=[("selected", COL_A), ("active", "#4a4e5a")])
 
     # -- 화면 구성 ----------------------------------------------------------
 
@@ -1535,14 +1735,24 @@ class App(tk.Tk):
         # 1) 파일 + 싱크
         top = ttk.Frame(root)
         top.pack(fill="x")
-        top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
+        top.columnconfigure(2, weight=1)
+        self._top_row = top
+
+        modebox = ttk.Labelframe(top, text="편집 모드", padding=P(8))
+        modebox.grid(row=0, column=0, sticky="nsew", padx=(0, P(12)))
+        self.var_mode = tk.StringVar(value=self.mode)
+        for txt, val in (("멀티캠", "multi"), ("싱글캠", "single")):
+            ttk.Radiobutton(modebox, text=txt, value=val, variable=self.var_mode,
+                            style="Mode.Toolbutton",
+                            command=self.on_mode).pack(side="left", padx=(0, P(1)))
 
         self.file_lbl = {}
+        self.file_box = {}
         for col, cam in enumerate(("A", "B")):
             box = ttk.Labelframe(top, text="카메라 %s %s" % (cam, "(기준 영상)" if cam == "A" else ""),
                                  padding=P(8))
-            box.grid(row=0, column=col, sticky="ew",
+            box.grid(row=0, column=col + 1, sticky="ew",
                      padx=(0, P(6)) if col == 0 else (P(6), 0))
             box.columnconfigure(1, weight=1)
             ttk.Button(box, text="영상 열기...",
@@ -1550,9 +1760,11 @@ class App(tk.Tk):
             lbl = ttk.Label(box, text="(선택 안 됨)", style="Muted.TLabel", anchor="w")
             lbl.grid(row=0, column=1, sticky="ew", padx=P(8))
             self.file_lbl[cam] = lbl
+            self.file_box[cam] = box
 
         sync = ttk.Frame(root)
         sync.pack(fill="x", pady=(P(8), 0))
+        self._sync_row = sync
         self.btn_sync = ttk.Button(sync, text="🔊  소리로 자동 싱크 맞추기",
                                    command=self.do_sync, state="disabled")
         self.btn_sync.pack(side="left")
@@ -1583,6 +1795,11 @@ class App(tk.Tk):
         prev.columnconfigure(0, weight=1)
         prev.columnconfigure(1, weight=1)
         prev.rowconfigure(1, weight=1)
+        self._prev = prev
+        # 싱글캠에서 편집 패널들이 옮겨 오는 자리 (_place_panels)
+        self._side = ttk.Frame(prev)
+        self._side.columnconfigure(0, weight=1)
+        self._side.columnconfigure(1, weight=1)
 
         self.cam_title = {}
         self.canvas_prev = {}
@@ -1600,10 +1817,13 @@ class App(tk.Tk):
 
         # 3) 타임라인
         tl = ttk.Labelframe(root, text="타임라인 (기준: 카메라 A 시간)", padding=P(6))
+        self._tl_box = tl
         self.tl_canvas = tk.Canvas(tl, height=P(104), bg=COL_PANEL, highlightthickness=0)
         self.tl_canvas.pack(fill="x")
-        self.tl_canvas.bind("<Button-1>", self._tl_click)
-        self.tl_canvas.bind("<B1-Motion>", self._tl_click)
+        self.tl_canvas.bind("<Button-1>", self._tl_press)
+        self.tl_canvas.bind("<B1-Motion>", self._tl_motion)
+        self.tl_canvas.bind("<ButtonRelease-1>", self._tl_release)
+        self.tl_canvas.bind("<Motion>", self._tl_hover)
         self.tl_canvas.bind("<Configure>", lambda ev: self.redraw_timeline())
 
         # 4) 이동 컨트롤
@@ -1630,21 +1850,44 @@ class App(tk.Tk):
         mid.columnconfigure(0, weight=3)     # 편집
         mid.columnconfigure(1, weight=0)     # 화면 보정 (내용만큼만)
         mid.columnconfigure(2, weight=2)     # 전환점 목록
+        self._mid = mid
 
-        edit = ttk.Labelframe(mid, text="편집", padding=P(8))
-        edit.grid(row=0, column=0, sticky="nsew", padx=(0, P(6)))
+        # 패널들은 root 의 자식으로 만들어 두고 mid 안에 놓는다. 그래야 싱글캠에서
+        # 미리보기 옆(_side)으로 옮길 수 있다. (Tk 는 자식의 자손 쪽으로만 옮길 수 있다)
+        edit = ttk.Labelframe(root, text="편집", padding=P(8))
+        edit.grid(in_=mid, row=0, column=0, sticky="nsew", padx=(0, P(6)))
+        self._edit_box = edit
 
         r1 = ttk.Frame(edit)
         r1.pack(fill="x")
         ttk.Label(r1, text="자르기:").pack(side="left")
-        ttk.Button(r1, text="[ 시작점 지정 (I)", command=self.set_in).pack(side="left", padx=P(3))
-        ttk.Button(r1, text="끝점 지정 ] (O)", command=self.set_out).pack(side="left", padx=P(3))
+        self.btn_in = ttk.Button(r1, text="[ 시작점 지정 (I)", command=self.set_in)
+        self.btn_in.pack(side="left", padx=P(3))
+        self.btn_out = ttk.Button(r1, text="끝점 지정 ] (O)", command=self.set_out)
+        self.btn_out.pack(side="left", padx=P(3))
         ttk.Button(r1, text="전체", command=self.reset_trim).pack(side="left", padx=P(3))
         self.trim_lbl = ttk.Label(edit, text="", style="Muted.TLabel")
         self.trim_lbl.pack(fill="x", pady=(P(4), P(8)))
 
+        # 싱글캠 전용 — 곡 시작/끝을 시간으로 입력하고, 그 자리로 바로 이동한다
+        self._r_trim2 = ttk.Frame(edit)
+        rt = self._r_trim2
+        self.var_trim_in = tk.StringVar(value="00:00.000")
+        self.var_trim_out = tk.StringVar(value="00:00.000")
+        for txt, var, which in (("곡 시작", self.var_trim_in, "in"),
+                                ("곡 끝", self.var_trim_out, "out")):
+            ttk.Label(rt, text=txt).pack(side="left", padx=(0, P(3)))
+            te = ttk.Entry(rt, textvariable=var, width=11, justify="right")
+            te.pack(side="left", padx=(0, P(10)))
+            te.bind("<Return>", lambda ev, w=which: self.apply_trim_entry(w))
+        ttk.Button(rt, text="◀ 곡 시작으로 (Home)",
+                   command=lambda: self.goto_trim("in")).pack(side="left", padx=P(3))
+        ttk.Button(rt, text="곡 끝으로 ▶ (End)",
+                   command=lambda: self.goto_trim("out")).pack(side="left", padx=P(3))
+
         r2 = ttk.Frame(edit)
         r2.pack(fill="x")
+        self._r_cut = r2
         ttk.Label(r2, text="전환점:").pack(side="left")
         ttk.Button(r2, text="여기서 A 로 (1)", style="A.TButton",
                    command=lambda: self.add_cut("A")).pack(side="left", padx=P(3))
@@ -1655,6 +1898,7 @@ class App(tk.Tk):
 
         r3 = ttk.Frame(edit)
         r3.pack(fill="x", pady=(P(8), 0))
+        self._r_cam = r3
         ttk.Label(r3, text="시작 카메라").pack(side="left")
         self.var_startcam = tk.StringVar(value="A")
         for cam in ("A", "B"):
@@ -1666,6 +1910,7 @@ class App(tk.Tk):
         # 페이드 / 전환 효과
         r4 = ttk.Frame(edit)
         r4.pack(fill="x", pady=(P(10), 0))
+        self._r_fade = r4
 
         def sec_box(parent, var, lo, hi, inc):
             sp = ttk.Spinbox(parent, from_=lo, to=hi, increment=inc, width=5,
@@ -1682,22 +1927,25 @@ class App(tk.Tk):
         self.var_fout = tk.StringVar(value="1.5")
         sec_box(r4, self.var_fout, 0, 10, 0.5)
 
-        ttk.Label(r4, text="   |   전환:").pack(side="left")
+        self._trans_box = ttk.Frame(r4)
+        self._trans_box.pack(side="left")
+        ttk.Label(self._trans_box, text="   |   전환:").pack(side="left")
         self.var_trans = tk.StringVar(value=TRANS_LABELS[1])
-        cbt = ttk.Combobox(r4, textvariable=self.var_trans, width=17, state="readonly",
+        cbt = ttk.Combobox(self._trans_box, textvariable=self.var_trans, width=17, state="readonly",
                            values=TRANS_LABELS)
         cbt.pack(side="left", padx=(P(6), P(6)))
         cbt.bind("<<ComboboxSelected>>", lambda ev: (self.focus_set(), self.update_ui()))
         self.var_tsec = tk.StringVar(value="0.5")
-        sec_box(r4, self.var_tsec, 0.1, 5, 0.1)
+        sec_box(self._trans_box, self.var_tsec, 0.1, 5, 0.1)
 
         for var in (self.var_fin, self.var_fout, self.var_tsec):
             var.trace_add("write", lambda *a: self.update_ui())
 
         # 카메라별 화면 보정 (회전 / 선명도 / 채도)
         # 편집 패널 아래에 붙이면 세로를 먹어 미리보기가 줄어든다 -> 옆 칸에 둔다.
-        adjbox = ttk.Labelframe(mid, text="화면 보정 (카메라별)", padding=P(6))
-        adjbox.grid(row=0, column=1, sticky="nsew", padx=P(6))
+        adjbox = ttk.Labelframe(root, text="화면 보정 (카메라별)", padding=P(6))
+        adjbox.grid(in_=mid, row=0, column=1, sticky="nsew", padx=P(6))
+        self._adj_box = adjbox
 
         # 카메라 한 대가 한 줄인 표.
         self.var_fine, self.var_expo, self.var_bright = {}, {}, {}
@@ -1774,8 +2022,41 @@ class App(tk.Tk):
             ttk.Label(mrow, text="(이 ffmpeg 은 노출 조절 미지원)",
                       style="Muted.TLabel").pack(side="left", padx=P(4))
 
-        cutbox = ttk.Labelframe(mid, text="전환점 목록", padding=P(6))
-        cutbox.grid(row=0, column=2, sticky="nsew", padx=(P(6), 0))
+        # 싱글캠에서 숨길 카메라 B 줄과, 혼자 남으면 뜻이 없는 'A' 글자
+        self._adj_hide = (adjbox.grid_slaves(row=3) + adjbox.grid_slaves(row=4) +
+                          adjbox.grid_slaves(row=1, column=0))
+
+        # 싱글캠 — 곡 제목 인트로
+        introbox = ttk.Labelframe(root, text="곡 제목 인트로 (선택 · 비워 두면 안 넣음)", padding=P(6))
+        introbox.grid(in_=mid, row=0, column=2, sticky="nsew", padx=(P(6), 0))
+        introbox.columnconfigure(1, weight=1)
+        self._intro_box = introbox
+        self.var_intro = tk.BooleanVar(value=True)
+        self.var_title = tk.StringVar()
+        self.var_composer = tk.StringVar()
+        self.var_intro_sec = tk.StringVar(value="%.1f" % INTRO_SEC)
+        for i, (txt, var) in enumerate((("곡 제목", self.var_title),
+                                        ("작곡가", self.var_composer))):
+            ttk.Label(introbox, text=txt).grid(row=i, column=0, sticky="w", pady=P(1))
+            ie = ttk.Entry(introbox, textvariable=var)
+            ie.grid(row=i, column=1, sticky="ew", padx=(P(6), 0), pady=P(1))
+            ie.bind("<Return>", lambda ev: self.focus_set())
+            var.trace_add("write", lambda *a: self.on_intro())
+        ir = ttk.Frame(introbox)
+        ir.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(P(5), 0))
+        ttk.Checkbutton(ir, text="넣기", variable=self.var_intro,
+                        command=self.on_intro).pack(side="left")
+        ttk.Label(ir, text="길이", style="Muted.TLabel").pack(side="left", padx=(P(8), P(3)))
+        ttk.Spinbox(ir, from_=INTRO_SEC_MIN, to=INTRO_SEC_MAX, increment=0.5, width=5,
+                    textvariable=self.var_intro_sec, command=self.on_intro).pack(side="left")
+        ttk.Label(ir, text="초", style="Muted.TLabel").pack(side="left", padx=(P(2), 0))
+        self.var_intro_sec.trace_add("write", lambda *a: self.on_intro())
+        ttk.Button(ir, text="▶ 처음부터", command=self.play_from_start).pack(side="right")
+        introbox.grid_remove()
+
+        cutbox = ttk.Labelframe(root, text="전환점 목록", padding=P(6))
+        cutbox.grid(in_=mid, row=0, column=2, sticky="nsew", padx=(P(6), 0))
+        self._cut_box = cutbox
         self.tree = ttk.Treeview(cutbox, columns=("t", "cam"), show="headings", height=4)
         self.tree.heading("t", text="시간")
         self.tree.heading("cam", text="카메라")
@@ -1790,12 +2071,13 @@ class App(tk.Tk):
 
         # 6) 내보내기
         exp = ttk.Labelframe(root, text="내보내기", padding=P(8))
+        self._exp_box = exp
         row = ttk.Frame(exp)
         row.pack(fill="x")
 
-        def combo(label, var, width, values):
-            ttk.Label(row, text=label).pack(side="left")
-            cb = ttk.Combobox(row, textvariable=var, width=width, state="readonly",
+        def combo(label, var, width, values, parent=row):
+            ttk.Label(parent, text=label).pack(side="left")
+            cb = ttk.Combobox(parent, textvariable=var, width=width, state="readonly",
                               values=values)
             cb.pack(side="left", padx=(P(4), P(12)))
             # 고른 뒤 포커스를 놓아 선택 강조가 남지 않게 하고, 요약 정보를 갱신한다
@@ -1803,16 +2085,18 @@ class App(tk.Tk):
             return cb
 
         self.var_res = tk.StringVar(value="1920x1080 (FHD)")
-        combo("해상도", self.var_res, 18,
-              ["A 영상과 동일", "1920x1080 (FHD)", "1280x720 (HD)",
-               "2560x1440 (QHD)", "3840x2160 (4K)"])
+        self._cb_res = combo("해상도", self.var_res, 18,
+                             [SAME_LABEL["multi"], "1920x1080 (FHD)", "1280x720 (HD)",
+                              "2560x1440 (QHD)", "3840x2160 (4K)"])
 
-        self.var_fps = tk.StringVar(value="A 영상과 동일")
-        combo("프레임", self.var_fps, 14,
-              ["A 영상과 동일", "24", "25", "29.97", "30", "50", "59.94", "60"])
+        self.var_fps = tk.StringVar(value=SAME_LABEL["multi"])
+        self._cb_fps = combo("프레임", self.var_fps, 14,
+                             [SAME_LABEL["multi"], "24", "25", "29.97", "30", "50", "59.94", "60"])
 
         self.var_audio = tk.StringVar(value="A")
-        combo("소리", self.var_audio, 12, ["A", "B"])
+        self._audio_box = ttk.Frame(row)     # 싱글캠에서는 고를 게 없어 통째로 숨긴다
+        self._audio_box.pack(side="left")
+        combo("소리", self.var_audio, 12, ["A", "B"], self._audio_box)
 
         self.var_q = tk.StringVar(value="표준")
         combo("화질", self.var_q, 12, ["고화질(느림)", "표준", "가벼움(빠름)"])
@@ -1886,6 +2170,11 @@ class App(tk.Tk):
             # 테두리를 빼지 않으면 딱 그만큼 넘쳐서 스크롤바가 괜히 생긴다.
             border = cv.winfo_reqheight() - int(float(cv.cget("height")))
             chrome = self._root_frame.winfo_reqheight() - cv.winfo_reqheight()
+            if self.single and self._side.winfo_ismapped():
+                # 옆 패널이 더 높으면 그 줄의 높이는 칸이 아니라 패널이 정한다.
+                # 칸 높이를 빼는 계산이 어긋나므로 줄 전체를 빼고 제목 자리만 더한다.
+                chrome = (self._root_frame.winfo_reqheight() - self._prev.winfo_reqheight()
+                          + self.cam_title["A"].winfo_reqheight() + self.px(4))
             h = self._vport.winfo_height() - chrome - border - self.px(2)
         h = max(self.px(110), h)
         if abs(cv.winfo_reqheight() - h) <= 2:
@@ -1900,6 +2189,9 @@ class App(tk.Tk):
         was_playing, at = self._playing, self.playhead
         if was_playing:
             self.stop_play()
+        if self.single:
+            self._place_panels()
+            self.update_idletasks()      # 패널이 빠진 뒤의 칸 폭으로 높이를 정해야 한다
         self._fit_preview()
         self.update_idletasks()
         self._sync_scroll()
@@ -1936,7 +2228,155 @@ class App(tk.Tk):
             self.bind("<KeyPress-%s>" % k, guard(self.set_out))
         for k in ("f", "F"):
             self.bind("<KeyPress-%s>" % k, guard(self.toggle_big_preview))
+        self.bind("<Home>", guard(lambda: self.goto_trim("in")))
+        self.bind("<End>", guard(lambda: self.goto_trim("out")))
         self.bind("<Control-s>", lambda ev: self.save_project())
+        self.bind_all("<Button-1>", self._release_entry, add="+")
+
+    def _release_entry(self, ev):
+        """
+        싱글캠에서 입력칸 밖을 누르면 포커스를 놓는다. 버튼은 눌러도 포커스를 가져가지
+        않아서, 제목을 친 뒤 재생을 누르고 I / O / Space 를 치면 글자가 제목에 찍힌다.
+        """
+        # 콤보박스 목록처럼 tkinter 가 모르는 창은 ev.widget 이 문자열이다
+        if self.single and isinstance(ev.widget, tk.Misc) and \
+                not isinstance(ev.widget, (ttk.Entry, ttk.Combobox)):
+            self.focus_set()
+
+    # -- 편집 모드 ------------------------------------------------------------
+
+    @property
+    def single(self):
+        return self.mode == "single"
+
+    def cams(self):
+        """지금 모드에서 쓰는 카메라들."""
+        return ("A",) if self.single else ("A", "B")
+
+    def on_mode(self):
+        mode = self.var_mode.get()
+        if mode == self.mode:
+            return
+        if self._playing:
+            self.stop_play()
+        old = self.span()
+        self.mode = mode
+        self._apply_mode()
+        if self.ready:
+            self._rebase_trim(old)
+            self.prog_lbl.configure(text=TRIM_HINT if self.single else "")
+        else:
+            self.prog_lbl.configure(text="영상을 열어 주세요." if self.single
+                                    else "영상 두 개를 열어 주세요.")
+        if self.single:
+            self._start_wave()
+        self.seek(self.playhead)
+        self.update_ui()
+
+    def _apply_mode(self):
+        """
+        모드에 맞춰 화면을 바꾼다. 카메라 한 대로는 할 수 없는 것(싱크, 전환점, 전환 효과,
+        두 화면 맞추기)은 숨기기만 하고 값은 지우지 않는다 — 멀티캠으로 돌아오면 하던
+        작업이 그대로 남아 있도록.
+        """
+        P = self.px
+        single = self.single
+        self.title("%s v%s%s" % (APP_TITLE, VERSION, " - 싱글캠" if single else ""))
+
+        self.file_box["A"].configure(text="영상" if single else "카메라 A (기준 영상)")
+        self.btn_in.configure(text="[ 곡 시작 지정 (I)" if single else "[ 시작점 지정 (I)")
+        self.btn_out.configure(text="곡 끝 지정 ] (O)" if single else "끝점 지정 ] (O)")
+        self._tl_box.configure(text="타임라인 - 초록 선을 끌어서 곡의 시작과 끝을 맞출 수 있습니다"
+                               if single else "타임라인 (기준: 카메라 A 시간)")
+        self._adj_box.configure(text="화면 보정" if single else "화면 보정 (카메라별)")
+
+        if single:
+            self.file_box["B"].grid_remove()
+            self.file_box["A"].grid(columnspan=2, padx=0)
+            self._sync_row.pack_forget()
+            self.cam_title["B"].grid_remove()
+            self.canvas_prev["B"].grid_remove()
+            self.cam_title["A"].grid(columnspan=2)
+            self.canvas_prev["A"].grid(columnspan=2, padx=0)
+            self._r_cut.pack_forget()
+            self._r_cam.pack_forget()
+            self._r_trim2.pack(fill="x", before=self._r_fade)
+            self._trans_box.pack_forget()
+            for w in self._adj_hide:
+                w.grid_remove()
+            self.btn_match["A"].pack_forget()
+            self._audio_box.pack_forget()
+        else:
+            self.file_box["B"].grid()
+            self.file_box["A"].grid(columnspan=1, padx=(0, P(6)))
+            self._sync_row.pack(fill="x", pady=(P(8), 0), after=self._top_row)
+            self.cam_title["B"].grid()
+            self.canvas_prev["B"].grid()
+            self.cam_title["A"].grid(columnspan=1)
+            self.canvas_prev["A"].grid(columnspan=1, padx=(0, P(5)))
+            self._r_trim2.pack_forget()
+            self._r_cut.pack(fill="x", before=self._r_fade)
+            self._r_cam.pack(fill="x", pady=(P(8), 0), before=self._r_fade)
+            self._trans_box.pack(side="left")
+            for w in self._adj_hide:
+                w.grid()
+            self.btn_match["A"].pack(side="left", padx=(P(10), 0))
+            self._audio_box.pack(side="left", after=self._cb_fps)
+        self._place_panels()
+
+        same = SAME_LABEL[self.mode]
+        for cb, var in ((self._cb_res, self.var_res), (self._cb_fps, self.var_fps)):
+            vals = [same if v in SAME_LABEL.values() else v
+                    for v in self.tk.splitlist(cb.cget("values"))]
+            cb.configure(values=vals)
+            if var.get() in SAME_LABEL.values():
+                var.set(same)
+
+        self.update_idletasks()
+        self._fit_preview()
+        self._sync_scroll()
+
+    def _place_panels(self):
+        """
+        편집 패널들을 놓는다. 싱글캠은 미리보기가 하나뿐이라 양옆이 텅 비므로, 패널을 그
+        옆으로 옮겨 미리보기가 세로로 커지게 한다. '크게' 에서는 화면을 꽉 채우도록 아래로
+        되돌린다 (멀티캠과 같은 배치, 스크롤해서 본다).
+        """
+        P = self.px
+        if self.single and not self._big_preview:
+            self._mid.pack_forget()
+            self._side.grid(row=0, column=2, rowspan=2, sticky="n", padx=(P(10), 0))
+            self._edit_box.grid(in_=self._side, row=0, column=0, columnspan=2,
+                                sticky="ew", padx=0, pady=0)
+            self._adj_box.grid(in_=self._side, row=1, column=0, sticky="nsew",
+                               padx=(0, P(4)), pady=(P(8), 0))
+            self._cut_box.grid_remove()
+            self._intro_box.grid(in_=self._side, row=1, column=1, sticky="nsew",
+                                 padx=(P(4), 0), pady=(P(8), 0))
+            return
+        self._side.grid_remove()
+        self._mid.pack(side="top", fill="x", pady=(P(10), 0), before=self._exp_box)
+        self._edit_box.grid(in_=self._mid, row=0, column=0, columnspan=1,
+                            sticky="nsew", padx=(0, P(6)), pady=0)
+        self._adj_box.grid(in_=self._mid, row=0, column=1, sticky="nsew", padx=P(6), pady=0)
+        if self.single:
+            self._cut_box.grid_remove()
+            self._intro_box.grid(in_=self._mid, row=0, column=2, sticky="nsew",
+                                 padx=(P(6), 0), pady=0)
+        else:
+            self._intro_box.grid_remove()
+            self._cut_box.grid()
+
+    def _rebase_trim(self, old):
+        """모드가 바뀌어 쓸 수 있는 범위가 달라졌을 때 자르기 구간을 맞춘다."""
+        lo, hi = self.span()
+        whole = (abs(self.trim_start - old[0]) < 1e-6 and abs(self.trim_end - old[1]) < 1e-6)
+        s = max(lo, min(self.trim_start, hi))
+        e = max(s, min(self.trim_end, hi))
+        if whole or e - s < self.frame_dur():
+            s, e = lo, hi
+        self.trim_start, self.trim_end = s, e
+        self.playhead = max(lo, min(self.playhead, hi))
 
     # -- 유틸 ---------------------------------------------------------------
 
@@ -1959,7 +2399,10 @@ class App(tk.Tk):
 
     @property
     def ready(self):
-        return self.info["A"] is not None and self.info["B"] is not None
+        return all(self.info[c] is not None for c in self.cams())
+
+    def audio_cam(self):
+        return "A" if self.single else self.var_audio.get()
 
     def out_fps(self):
         v = self.var_fps.get()
@@ -1971,7 +2414,7 @@ class App(tk.Tk):
 
     def out_size(self):
         v = self.var_res.get()
-        if v.startswith("A ") and self.info["A"]:
+        if v in SAME_LABEL.values() and self.info["A"]:
             w, h = self.info["A"].width, self.info["A"].height
         else:
             m = re.match(r"(\d+)x(\d+)", v)
@@ -1997,8 +2440,92 @@ class App(tk.Tk):
     def fade_settings(self):
         """(시작 페이드초, 끝 페이드초, 전환모드, 전환길이초)"""
         return (self._fnum(self.var_fin), self._fnum(self.var_fout),
-                TRANS_BY_LABEL.get(self.var_trans.get(), "none"),
+                "none" if self.single else TRANS_BY_LABEL.get(self.var_trans.get(), "none"),
                 self._fnum(self.var_tsec))
+
+    # -- 곡 제목 인트로 (싱글캠) ------------------------------------------------
+
+    def intro_settings(self):
+        """인트로를 넣을 거면 {'title', 'composer', 'sec'}, 아니면 None."""
+        if not (self.single and self.var_intro.get()):
+            return None
+        title = self.var_title.get().strip()
+        composer = self.var_composer.get().strip()
+        if not (title or composer):
+            return None
+        sec = self._fnum(self.var_intro_sec, INTRO_SEC)
+        return {"title": title, "composer": composer,
+                "sec": max(INTRO_SEC_MIN, min(INTRO_SEC_MAX, sec))}
+
+    def on_intro(self, *a):
+        """글자를 칠 때마다 다시 그리지 않도록 잠깐 모아서 반영."""
+        if self._intro_after:
+            self.after_cancel(self._intro_after)
+        self._intro_after = self.after(300, self._apply_intro_change)
+        self.update_ui()
+
+    def _apply_intro_change(self):
+        self._intro_after = None
+        if self._playing or not self.ready:
+            return
+        # 고친 결과가 바로 보이도록 인트로가 안 보이는 위치면 그 자리로 옮긴다
+        if self.intro_settings() and not self._intro_at(self.playhead):
+            self.seek(self.trim_start)
+        else:
+            self.refresh_preview()
+
+    def play_from_start(self):
+        if not self.ready:
+            return
+        if self._playing:
+            self.stop_play()
+        self.seek(self.trim_start)
+        self.start_play()
+
+    def _intro_at(self, t):
+        """t 시각의 인트로 (설정, 세기). 인트로 구간 밖이면 None."""
+        iv = self.intro_settings()
+        if not iv:
+            return None
+        sec = min(iv["sec"], self.trim_end - self.trim_start)
+        level = intro_level(t - self.trim_start, sec) if sec > 0 else 0.0
+        return (iv, level) if level > 0 else None
+
+    def _intro_letters(self, iv, w, h):
+        """글자 그림에서 글자가 있는 부분만 오려 둔다. (색, 투명도, 위치)
+        재생 중에는 매 프레임 쓰므로 내용과 크기가 그대로면 다시 그리지 않는다."""
+        key = (iv["title"], iv["composer"], w, h)
+        if self._intro_cache and self._intro_cache[0] == key:
+            return self._intro_cache[1]
+        layer = render_intro_layer(w, h, iv["title"], iv["composer"])
+        box = layer.getchannel("A").getbbox() or (0, 0, 1, 1)
+        cut = layer.crop(box)
+        made = (cut.convert("RGB"), cut.getchannel("A"), (box[0], box[1]))
+        self._intro_cache = (key, made)
+        return made
+
+    def _apply_intro(self, img, iv, level):
+        """
+        미리보기 프레임에 인트로를 입힌다. 내보내기와 같은 값을 쓰되, 재생을 따라가도록
+        블러는 1/4 크기에서 건다. 글자는 출력 화면 비율로 그려 크기를 그대로 확인할 수 있다.
+        """
+        from PIL import Image, ImageEnhance, ImageFilter
+        w, h = img.size
+        ow, oh = self.out_size()
+        fit = min(w / float(ow), h / float(oh))
+        rw, rh = max(2, int(ow * fit)), max(2, int(oh * fit))
+        st = intro_style(rw, rh)
+
+        small = img.resize((max(1, w // 4), max(1, h // 4)), Image.BILINEAR)
+        small = small.filter(ImageFilter.GaussianBlur(st["blur"] / 4.0))
+        soft = ImageEnhance.Brightness(small.resize((w, h), Image.BILINEAR)).enhance(st["dim"])
+        out = soft if level >= 1.0 else Image.blend(img, soft, level)
+
+        rgb, alpha, (x, y) = self._intro_letters(iv, rw, rh)
+        if level < 1.0:
+            alpha = alpha.point(lambda v: int(v * level))
+        out.paste(rgb, ((w - rw) // 2 + x, (h - rh) // 2 + y), alpha)
+        return out
 
     # -- 카메라별 화면 보정 ---------------------------------------------------
 
@@ -2180,6 +2707,8 @@ class App(tk.Tk):
         """A 기준 시간으로 각 카메라가 화면을 가진 범위."""
         if not self.ready:
             return {"A": (0.0, 0.0), "B": (0.0, 0.0)}
+        if self.single:
+            return {"A": (0.0, float(self.info["A"].duration)), "B": (0.0, 0.0)}
         return cam_ranges(self.info["A"].duration, self.info["B"].duration,
                           self.offset)
 
@@ -2195,6 +2724,8 @@ class App(tk.Tk):
         return lo - 1e-6 <= t <= hi + 1e-6
 
     def cam_at(self, t):
+        if self.single:
+            return "A"
         cam = self.start_cam
         for ct, cc in self.cuts:
             if ct <= t + 1e-9:
@@ -2206,6 +2737,8 @@ class App(tk.Tk):
     def segments(self):
         """[(시작, 끝, 카메라)] — 트림 구간을 빈틈없이 채운다.
         한 대만 찍힌 구간은 그 카메라로 자동 대체한다."""
+        if self.single:
+            return compute_segments(self.trim_start, self.trim_end, [], "A")
         segs = compute_segments(self.trim_start, self.trim_end,
                                 self.cuts, self.start_cam)
         return apply_coverage(segs, self.ranges()) if self.ready else segs
@@ -2214,11 +2747,14 @@ class App(tk.Tk):
 
     def open_video(self, cam):
         path = filedialog.askopenfilename(
-            title="카메라 %s 영상 선택" % cam,
+            title="영상 선택" if self.single else "카메라 %s 영상 선택" % cam,
             filetypes=[("영상 파일", "*.mp4 *.mov *.mkv *.avi *.m4v *.mts *.m2ts *.wmv *.webm"),
                        ("모든 파일", "*.*")])
         if not path:
             return
+        self._load_video(cam, path)
+
+    def _load_video(self, cam, path):
         try:
             info = probe(self.fp, path)
         except Exception as e:
@@ -2230,13 +2766,60 @@ class App(tk.Tk):
                  % (info.name, info.width, info.height, info.fps, fmt_time(info.duration)))
         self.env[cam] = None
         if cam == "A":
-            self.var_res.set("A 영상과 동일" if info.width >= 1280 else "1920x1080 (FHD)")
+            self._wave_token += 1     # 옛 영상의 파형이 뒤늦게 도착해도 버리도록
+            # 싱글캠은 다른 영상에 맞출 일이 없다. 세로 영상도 세로 그대로 내보낸다.
+            self.var_res.set(SAME_LABEL[self.mode] if self.single or info.width >= 1280
+                             else "1920x1080 (FHD)")
         if self.ready:
             self.reset_trim()
-            if not info.has_audio or not self.info["A" if cam == "B" else "B"].has_audio:
+            if self.single:
+                self._start_wave()
+            elif not info.has_audio or not self.info["A" if cam == "B" else "B"].has_audio:
                 self.sync_lbl.configure(text="한쪽에 소리가 없어 자동 싱크 불가 — 직접 입력하세요")
         self.update_ui()
         self.refresh_preview()
+
+    def _start_wave(self):
+        """
+        싱글캠에는 싱크 단계가 없어 파형을 따로 구한다. 곡이 어디서 시작하고
+        끝나는지 눈으로 찾는 데 쓴다. 긴 영상도 편집을 막지 않도록 뒤에서 돌린다.
+        """
+        self._wave_token += 1
+        tok = self._wave_token
+        info = self.info["A"]
+        if info is None:
+            return
+        if not info.has_audio:
+            self.prog_lbl.configure(text="이 영상에는 소리가 없어 파형을 그릴 수 없습니다.")
+            return
+        if self.env["A"] is not None:
+            return
+
+        def work():
+            try:
+                env = load_envelope(self.ff, info.path, self.np,
+                                    progress=lambda f: self._uiq.put(("wave_prog", tok, f)),
+                                    duration=info.duration)
+            except Exception:
+                env = None
+            self._uiq.put(("wave", tok, env))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_wave_prog(self, tok, frac):
+        if tok == self._wave_token and self.single and not self._export:
+            self.prog["value"] = int(frac * 1000)
+            self.prog_lbl.configure(text="소리 분석 중... (편집은 계속할 수 있습니다)")
+
+    def _on_wave(self, tok, env):
+        if tok != self._wave_token:
+            return
+        if self.single and not self._export:
+            self.prog["value"] = 0
+            self.prog_lbl.configure(text=TRIM_HINT)
+        if env is not None and len(env) > 1:
+            self.env["A"] = env
+            self.redraw_timeline()
 
     # -- 싱크 ---------------------------------------------------------------
 
@@ -2322,6 +2905,12 @@ class App(tk.Tk):
         self.var_pos.set(fmt_time(t))
         cam = self.cam_at(t)
         inside = self.trim_start - 1e-6 <= t <= self.trim_end + 1e-6
+        if self.single:
+            where = "곡 제목 인트로" if self._intro_at(t) else ("" if inside else "✂ 잘려나가는 구간")
+            self.pos_lbl.configure(text=where)
+            self.canvas_prev["A"].configure(highlightbackground=COL_A if inside else "#333")
+            self.cam_title["A"].configure(text="미리보기" + ("   " + where if where else ""))
+            return
         self.pos_lbl.configure(
             text="출력 카메라: %s%s" % (cam, "" if inside else "   (잘려나가는 구간)"))
         for c in ("A", "B"):
@@ -2366,7 +2955,15 @@ class App(tk.Tk):
 
     def start_play(self):
         t0 = self.playhead
-        if not (self.trim_start <= t0 < self.trim_end - 0.05):
+        self._play_tail = False
+        if self.single:
+            # 잘려나갈 부분도 들어 볼 수 있어야 곡의 시작과 끝을 찾을 수 있다.
+            # 시작점 앞에서 누르면 거기서부터, 끝점 뒤에서 누르면 영상 끝까지 튼다.
+            if self.trim_end + 0.05 < t0 < self.span()[1] - 0.05:
+                self._play_tail = True
+            elif t0 >= self.trim_end - 0.05:
+                t0 = self.trim_start
+        elif not (self.trim_start <= t0 < self.trim_end - 0.05):
             t0 = self.trim_start
         # 미리보기 칸 크기에 맞춰 디코딩 -> 파이썬에서 크기를 다시 줄일 필요가 없다
         cv = self.canvas_prev["A"]
@@ -2374,25 +2971,33 @@ class App(tk.Tk):
         # (_blit 은 디코딩된 크기 그대로 올린다).
         bw = max(320, min(1600, cv.winfo_width() - 4))
         bh = max(180, min(900, cv.winfo_height() - 4))
+        if self.single:
+            # 칸 전체가 아니라 영상이 실제로 차지하는 크기까지만 디코딩한다 (검은 여백 낭비)
+            aspect = self.info["A"].width / float(max(1, self.info["A"].height))
+            bw = max(320, min(bw, int(bh * aspect)))
+            bh = max(180, min(bh, int(bw / aspect)))
         bw, bh = (bw // 2) * 2, (bh // 2) * 2
         self._play_box = (bw, bh)
         self._play_photo = {}
         self._play_item = {}
         self._play_gap = {"A": None, "B": None}
         self._play_blank = set()
+        self._intro_buf = None
         for c in ("A", "B"):        # 아직 오지 않은 정지화면 요청을 무효화
             self._token[c] += 1
 
-        acam = self.var_audio.get()
+        acam = self.audio_cam()
         audio = None
         if self.info[acam].has_audio:
             aoff = self.offset if acam == "B" else 0.0
             audio = (self.info[acam].path, t0 + aoff)
 
+        sources = {"A": (self.info["A"].path, t0)}
+        if not self.single:
+            sources["B"] = (self.info["B"].path, t0 + self.offset)
         try:
             self._player.start(
-                {"A": (self.info["A"].path, t0),
-                 "B": (self.info["B"].path, t0 + self.offset)},
+                sources,
                 t0, (bw, bh), vfps=30.0, audio=audio, filters=self.cam_filters())
         except Exception as e:
             messagebox.showerror(APP_TITLE, "재생을 시작할 수 없습니다:\n" + str(e))
@@ -2404,7 +3009,10 @@ class App(tk.Tk):
             self.prog_lbl.configure(
                 text="소리 없이 화면만 재생합니다 — %s" % self._player.audio_error[:70])
         elif self._player.audio is None:
-            self.prog_lbl.configure(text="카메라 %s 에 소리가 없어 화면만 재생합니다." % acam)
+            self.prog_lbl.configure(text="이 영상에 소리가 없어 화면만 재생합니다." if self.single
+                                    else "카메라 %s 에 소리가 없어 화면만 재생합니다." % acam)
+        elif self.single:
+            self.prog_lbl.configure(text="재생 중 — I / O 키로 바로 곡 시작과 끝을 찍을 수 있습니다.")
         else:
             self.prog_lbl.configure(text="재생 중 — 1/2 키로 바로 전환점을 찍을 수 있습니다.")
         self._play_after = self.after(20, self._tick_play)
@@ -2429,13 +3037,14 @@ class App(tk.Tk):
         # 화면만 멈춰 버린다. 무슨 일이 있어도 다시 예약한다.
         try:
             now = self._player.time()
-            if now >= self.trim_end:
-                self._apply_pos(min(now, self.trim_end))
+            end = self.span()[1] if self._play_tail else self.trim_end
+            if now >= end:
+                self._apply_pos(min(now, end))
                 self.stop_play()
                 return
 
             self._apply_pos(now)
-            for cam in ("A", "B"):
+            for cam in self.cams():
                 self._show_play_frame(cam, now)
             self._move_playhead(now)
         except Exception:
@@ -2447,7 +3056,7 @@ class App(tk.Tk):
         if buf is not None:
             self._play_gap[cam] = None
             self._play_blank.discard(cam)
-            self._blit(cam, buf)
+            self._blit(cam, buf, now)
             return
         # 이 카메라에서 프레임이 안 온다. 잠깐이면 디코딩이 늦는 것이지만,
         # 계속 안 오면 이 시점에 영상이 없는 것이므로 옛 화면을 남겨 두지 않는다.
@@ -2459,14 +3068,21 @@ class App(tk.Tk):
             self._play_item.pop(cam, None)
             self._draw_placeholder(cam, "이 시점에는 영상이 없습니다")
 
-    def _blit(self, cam, buf):
+    def _blit(self, cam, buf, now=None):
         """디코딩된 원본 픽셀을 미리보기 칸에 그대로 올린다."""
         from PIL import Image, ImageTk
+        intro = self._intro_at(now) if self.single and now is not None else None
+        # 인트로를 입히는 건 비싸다. 프레임이 새로 오지 않았으면 다시 하지 않는다.
+        if intro and buf is self._intro_buf and cam in self._play_photo:
+            return
         w, h = self._play_box
         try:
             img = Image.frombytes("RGB", (w, h), buf)
         except ValueError:
             return
+        if intro:
+            self._intro_buf = buf
+            img = self._apply_intro(img, intro[0], intro[1])
         photo = self._play_photo.get(cam)
         cv = self.canvas_prev[cam]
         if photo is None:
@@ -2483,7 +3099,8 @@ class App(tk.Tk):
     def reset_trim(self):
         lo, hi = self.span()
         self.trim_start, self.trim_end = lo, hi
-        self.cuts = [c for c in self.cuts if lo <= c[0] <= hi]
+        if not self.single:           # 싱글캠에서는 멀티캠 전환점을 건드리지 않는다
+            self.cuts = [c for c in self.cuts if lo <= c[0] <= hi]
         self.seek(max(lo, min(self.playhead, hi)))
         self.update_ui()
 
@@ -2501,8 +3118,35 @@ class App(tk.Tk):
         self.seek(t)
         self.update_ui()
 
+    def goto_trim(self, which):
+        """곡 시작 / 곡 끝 자리로 이동 (싱글캠)."""
+        if not (self.single and self.ready):
+            return
+        if self._playing:
+            self.stop_play()
+        self.seek(self.trim_start if which == "in" else self.trim_end)
+
+    def apply_trim_entry(self, which):
+        """곡 시작 / 곡 끝을 시간으로 직접 입력 (싱글캠)."""
+        var = self.var_trim_in if which == "in" else self.var_trim_out
+        try:
+            t = parse_time(var.get())
+        except ValueError:
+            t = None
+        self.focus_set()              # 포커스를 놓아 단축키가 다시 먹게 하고, 칸도 갱신되게
+        if t is None:
+            self.update_ui()
+            return
+        if self._playing:
+            self.stop_play()
+        self.seek(t)
+        if which == "in":
+            self.set_in()
+        else:
+            self.set_out()
+
     def add_cut(self, cam):
-        if not self.ready:
+        if self.single or not self.ready:
             return
         t = self.snap(self.playhead)
         if not (self.trim_start < t < self.trim_end):
@@ -2561,13 +3205,17 @@ class App(tk.Tk):
     def refresh_preview(self, only=None):
         if not self.ready or self._playing:
             return
-        for cam in (("A", "B") if only is None else (only,)):
+        for cam in (self.cams() if only is None else (only,)):
             info = self.info[cam]
-            if info is None:
+            if info is None or cam not in self.cams():
                 continue
             t = self.playhead + (self.offset if cam == "B" else 0.0)
             cv = self.canvas_prev[cam]
             w = max(160, cv.winfo_width())
+            if self.single:
+                # 칸이 아주 넓어도 영상이 실제로 차지하는 폭까지만 뽑는다
+                w = max(160, min(w, int(cv.winfo_height() * info.width
+                                        / float(max(1, info.height))) + 2))
             if t < 0 or t > info.duration:
                 self._token[cam] += 1
                 self._draw_placeholder(cam, "이 시점에는 영상이 없습니다")
@@ -2605,9 +3253,21 @@ class App(tk.Tk):
             return
         from PIL import Image, ImageTk
         iw, ih = img.size
-        scale = min(cw / float(iw), ch / float(ih))
-        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-        img = img.resize((nw, nh), Image.BILINEAR)
+        intro = self._intro_at(self.playhead) if self.single else None
+        if intro:
+            # 인트로 구간은 실제 출력 화면 비율로 보여 준다 (세로 영상의 검은 여백까지)
+            ow, oh = self.out_size()
+            fit = min(cw / float(ow), ch / float(oh))
+            rw, rh = max(2, int(ow * fit)), max(2, int(oh * fit))
+            scale = min(rw / float(iw), rh / float(ih))
+            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+            frame = Image.new("RGB", (rw, rh))
+            frame.paste(img.resize((nw, nh), Image.BILINEAR), ((rw - nw) // 2, (rh - nh) // 2))
+            img = self._apply_intro(frame, intro[0], intro[1])
+        else:
+            scale = min(cw / float(iw), ch / float(ih))
+            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+            img = img.resize((nw, nh), Image.BILINEAR)
         photo = ImageTk.PhotoImage(img)
         self._photo[cam] = photo
         cv.delete("all")
@@ -2623,7 +3283,9 @@ class App(tk.Tk):
         W = max(1, cv.winfo_width())
         H = P(104)
         if not self.ready:
-            cv.create_text(W // 2, H // 2, text="영상을 두 개 열면 타임라인이 표시됩니다.",
+            cv.create_text(W // 2, H // 2,
+                           text="영상을 열면 타임라인이 표시됩니다." if self.single
+                           else "영상을 두 개 열면 타임라인이 표시됩니다.",
                            fill=COL_MUTED, font=self.font)
             return
 
@@ -2638,10 +3300,12 @@ class App(tk.Tk):
         env = self.env["A"]
         if env is not None and len(env) > 1:
             mx = float(env.max()) or 1.0
-            step = max(1, len(env) // max(1, W))
+            # 싱글캠은 파형을 보고 자르므로 소리가 영상보다 짧아도 시간에 정확히 맞춘다
+            span_len = dur / self.hop_sec if self.single else len(env)
+            step = max(1, int(span_len) // max(1, W))
             pts = []
             for x in range(W):
-                i0 = int(x / float(W) * len(env))
+                i0 = int(x / float(W) * span_len)
                 seg = env[i0:i0 + step]
                 v = float(seg.max()) / mx if len(seg) else 0.0
                 pts.append(v)
@@ -2653,12 +3317,13 @@ class App(tk.Tk):
 
         # 각 카메라가 화면을 가진 구간 (한쪽만 찍힌 데를 한눈에 보이게)
         rng = self.ranges()
-        for i, cam in enumerate(("A", "B")):
-            lo, hi = rng[cam]
-            y = P(38) + i * P(3)
-            cv.create_rectangle(0, y, W, y + P(2), fill="#2f333c", width=0)
-            cv.create_rectangle(x_of(max(lo, t0)), y, x_of(min(hi, t1)), y + P(2),
-                                fill=COL_A if cam == "A" else COL_B, width=0)
+        if not self.single:
+            for i, cam in enumerate(("A", "B")):
+                lo, hi = rng[cam]
+                y = P(38) + i * P(3)
+                cv.create_rectangle(0, y, W, y + P(2), fill="#2f333c", width=0)
+                cv.create_rectangle(x_of(max(lo, t0)), y, x_of(min(hi, t1)), y + P(2),
+                                    fill=COL_A if cam == "A" else COL_B, width=0)
 
         # 카메라 구간
         band_top, band_h = P(44), P(26)
@@ -2667,7 +3332,7 @@ class App(tk.Tk):
             x0, x1 = x_of(s), x_of(e)
             cv.create_rectangle(x0, band_top, max(x0 + 1, x1), band_top + band_h,
                                 fill=COL_A if cam == "A" else COL_B, width=0)
-            if x1 - x0 > P(18):
+            if x1 - x0 > P(18) and not self.single:
                 cv.create_text((x0 + x1) // 2, band_top + band_h // 2, text=cam,
                                fill="#fff", font=self.font_b)
 
@@ -2679,6 +3344,10 @@ class App(tk.Tk):
         for t, col in ((self.trim_start, "#7fe08a"), (self.trim_end, "#7fe08a")):
             x = x_of(t)
             cv.create_line(x, 0, x, band_top + band_h + P(2), fill=col, width=P(2))
+            if self.single:              # 끌 수 있다는 걸 보여 주는 손잡이
+                mid = band_top + band_h // 2
+                cv.create_rectangle(x - P(4), mid - P(9), x + P(4), mid + P(9),
+                                    fill=col, width=0)
 
         # 전환 구간(디졸브/검정 페이드)을 띠 위에 겹쳐 표시
         for s, e in self.transition_spans():
@@ -2694,8 +3363,19 @@ class App(tk.Tk):
                 cv.create_rectangle(x_of(a0), band_top, x_of(a1), band_top + band_h,
                                     fill="#000000", stipple="gray50", width=0)
 
+        # 곡 제목 인트로 구간
+        iv = self.intro_settings()
+        if iv and self.trim_end > self.trim_start:
+            x0 = x_of(self.trim_start)
+            x1 = x_of(min(self.trim_end, self.trim_start + iv["sec"]))
+            cv.create_rectangle(x0, band_top, max(x0 + 2, x1), band_top + band_h,
+                                fill="#b18cff", stipple="gray50", width=0)
+            if x1 - x0 > P(44):
+                cv.create_text((x0 + x1) // 2, band_top + band_h // 2, text="제목",
+                               fill="#fff", font=self.font_s)
+
         # 전환점 표시
-        for t, cam in self.cuts:
+        for t, cam in (() if self.single else self.cuts):
             if self.trim_start <= t <= self.trim_end:
                 x = x_of(t)
                 cv.create_line(x, band_top - P(6), x, band_top + band_h + P(6),
@@ -2741,16 +3421,64 @@ class App(tk.Tk):
                 return s
         return 3600
 
+    def _tl_time(self, x):
+        """타임라인 x 좌표 -> 시각."""
+        W = max(1, self.tl_canvas.winfo_width())
+        t0, t1 = self.span()
+        dur = max(0.001, t1 - t0)
+        return max(t0, min(t1, t0 + (x - 1) / float(W - 2) * dur))
+
+    def _tl_x(self, t):
+        """시각 -> 타임라인 x 좌표 (redraw_timeline 의 x_of 와 같은 식)."""
+        W = max(1, self.tl_canvas.winfo_width())
+        t0, t1 = self.span()
+        return int((t - t0) / max(0.001, t1 - t0) * (W - 2)) + 1
+
+    def _trim_handle_at(self, x):
+        """싱글캠에서 x 위치에 자르기 손잡이가 있으면 'in' / 'out'."""
+        if not (self.single and self.ready):
+            return None
+        xi, xo = self._tl_x(self.trim_start), self._tl_x(self.trim_end)
+        di, do = abs(x - xi), abs(x - xo)
+        if min(di, do) > self.px(6):
+            return None
+        # 두 손잡이가 겹쳐 있으면 누른 쪽 바깥으로 벌어지게
+        return "in" if di < do or (di == do and x <= xi) else "out"
+
+    def _tl_press(self, ev):
+        self._tl_drag = self._trim_handle_at(ev.x)
+        if self._tl_drag:
+            self.goto_trim(self._tl_drag)
+        else:
+            self._tl_click(ev)
+
+    def _tl_motion(self, ev):
+        if not self._tl_drag:
+            self._tl_click(ev)
+            return
+        t = self._tl_time(ev.x)
+        fd = self.frame_dur()
+        if self._tl_drag == "in":
+            self.trim_start = min(t, self.trim_end - fd)
+            self.seek(self.trim_start, redraw=False)
+        else:
+            self.trim_end = max(t, self.trim_start + fd)
+            self.seek(self.trim_end, redraw=False)
+        self.update_ui()
+
+    def _tl_release(self, ev):
+        self._tl_drag = None
+
+    def _tl_hover(self, ev):
+        self.tl_canvas.configure(
+            cursor="sb_h_double_arrow" if self._trim_handle_at(ev.x) else "")
+
     def _tl_click(self, ev):
         if not self.ready:
             return
         if self._playing:
             self.stop_play()
-        W = max(1, self.tl_canvas.winfo_width())
-        t0, t1 = self.span()
-        dur = max(0.001, t1 - t0)
-        t = max(t0, min(t1, t0 + (ev.x - 1) / float(W - 2) * dur))
-        self.seek(t)
+        self.seek(self._tl_time(ev.x))
 
     # -- 상태 갱신 -----------------------------------------------------------
 
@@ -2764,7 +3492,33 @@ class App(tk.Tk):
         can = ok and total > 0.2 and len(segs) > 0
         self.btn_export.state(["!disabled"] if can and not self._export else ["disabled"])
 
-        if ok:
+        if ok and self.single:
+            lo, hi = self.span()
+            self.trim_lbl.configure(
+                text="남길 구간  %s  →  %s   (길이 %s)   ·   앞 %s, 뒤 %s 잘림"
+                     % (fmt_time(self.trim_start), fmt_time(self.trim_end), fmt_time(total),
+                        fmt_time(self.trim_start - lo), fmt_time(hi - self.trim_end)))
+            try:
+                focused = self.focus_get()
+            except KeyError:          # 콤보박스 목록이 열려 있으면 tkinter 가 이렇게 실패한다
+                focused = None
+            for var, t in ((self.var_trim_in, self.trim_start),
+                           (self.var_trim_out, self.trim_end)):
+                # 입력 중인 칸은 건드리지 않는다
+                if not isinstance(focused, ttk.Entry) or str(focused.cget("textvariable")) != str(var):
+                    var.set(fmt_time(t))
+            w, h = self.out_size()
+            fi, fo, _, _ = self.fade_settings()
+            extra = ""
+            iv = self.intro_settings()
+            if iv:
+                extra += " · 제목 인트로 %.1f초" % min(iv["sec"], total)
+            if fi > 0 or fo > 0:
+                extra += " · 페이드 %.1f/%.1f초" % (fi, fo)
+            self.est_lbl.configure(
+                text="길이 %s · %dx%d @ %.2ffps%s"
+                     % (fmt_time(total), w, h, self.out_fps()[1], extra))
+        elif ok:
             lo, hi = self.overlap()
             self.trim_lbl.configure(
                 text="사용 구간  %s  →  %s   (길이 %s)   ·   두 영상이 겹치는 범위 %s ~ %s"
@@ -2784,6 +3538,9 @@ class App(tk.Tk):
             self.est_lbl.configure(
                 text="장면 %d개 · 길이 %s · %dx%d @ %.2ffps%s"
                      % (len(segs), fmt_time(total), w, h, self.out_fps()[1], extra))
+        else:
+            self.trim_lbl.configure(text="")
+            self.est_lbl.configure(text="")
         self.redraw_timeline()
 
     # -- 내보내기 -----------------------------------------------------------
@@ -2794,18 +3551,23 @@ class App(tk.Tk):
             return
         if self._playing:
             self.stop_play()
-        acam = self.var_audio.get()
+        acam = self.audio_cam()
         if not self.info[acam].has_audio:
-            messagebox.showerror(APP_TITLE, "카메라 %s 영상에는 소리가 없습니다." % acam)
+            messagebox.showerror(APP_TITLE, "이 영상에는 소리가 없습니다." if self.single
+                                 else "카메라 %s 영상에는 소리가 없습니다." % acam)
             return
 
         default = "합본_%s.mp4" % time.strftime("%m%d_%H%M")
+        iv = self.intro_settings()
+        if self.single:
+            stem = (iv and iv["title"]) or os.path.splitext(self.info["A"].name)[0] + "_편집"
+            default = re.sub(r'[\\/:*?"<>|]', "_", stem) + ".mp4"
         out = filedialog.asksaveasfilename(
             title="저장할 파일 이름", defaultextension=".mp4",
             initialfile=default, filetypes=[("MP4 영상", "*.mp4")])
         if not out:
             return
-        for cam in ("A", "B"):
+        for cam in self.cams():
             if os.path.abspath(out) == os.path.abspath(self.info[cam].path):
                 messagebox.showerror(APP_TITLE, "원본 영상을 덮어쓸 수 없습니다.")
                 return
@@ -2822,12 +3584,14 @@ class App(tk.Tk):
                      "-pix_fmt", "yuv420p"]
 
         fi, fo, tmode, tsec = self.fade_settings()
-        plan = build_plan(segs, self.info["A"].path, self.info["B"].path,
+        plan = build_plan(segs, self.info["A"].path,
+                          None if self.single else self.info["B"].path,
                           self.offset, self.trim_start, self.trim_end,
                           w, h, fps_str, fps, vargs, acam, out,
                           fade_in=fi, fade_out=fo,
                           trans_mode=tmode, trans_sec=tsec,
-                          adjust=self.adjust_all(), sizes=self.cam_sizes())
+                          adjust=self.adjust_all(), sizes=self.cam_sizes(),
+                          intro=iv)
 
         self._export = ExportJob(
             self.ff, plan,
@@ -2869,8 +3633,9 @@ class App(tk.Tk):
             return
         data = {
             "version": VERSION,
+            "mode": self.mode,
             "video_a": self.info["A"].path,
-            "video_b": self.info["B"].path,
+            "video_b": None if self.single else self.info["B"].path,
             "offset": self.offset,
             "trim_start": self.trim_start,
             "trim_end": self.trim_end,
@@ -2881,6 +3646,10 @@ class App(tk.Tk):
             "trans_mode": TRANS_BY_LABEL.get(self.var_trans.get(), "none"),
             "trans_sec": self._fnum(self.var_tsec),
             "adjust": self.adjust_all(),
+            "intro": {"on": bool(self.var_intro.get()),
+                      "title": self.var_title.get(),
+                      "composer": self.var_composer.get(),
+                      "sec": self._fnum(self.var_intro_sec, INTRO_SEC)},
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2895,7 +3664,18 @@ class App(tk.Tk):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for cam, key in (("A", "video_a"), ("B", "video_b")):
+            # 예전 프로젝트에는 mode 가 없다 — 전부 멀티캠이다
+            mode = "single" if data.get("mode") == "single" else "multi"
+            if self._playing:
+                self.stop_play()
+            if mode != self.mode:
+                self.mode = mode
+                self.var_mode.set(mode)
+                self._apply_mode()
+            if mode == "single":
+                self.info["B"] = None
+                self.file_lbl["B"].configure(text="(선택 안 됨)")
+            for cam, key in (("A", "video_a"), ("B", "video_b"))[:len(self.cams())]:
                 p = data[key]
                 if not os.path.exists(p):
                     messagebox.showerror(APP_TITLE, "영상 파일을 찾을 수 없습니다:\n" + p)
@@ -2927,7 +3707,14 @@ class App(tk.Tk):
                     holder[cam].set("%g" % float(a[key]))
                 for key, v in self.var_cut[cam].items():
                     v.set("%g" % float(a[key]))
+            iv = data.get("intro") or {}
+            self.var_intro.set(bool(iv.get("on", True)))
+            self.var_title.set(iv.get("title", ""))
+            self.var_composer.set(iv.get("composer", ""))
+            self.var_intro_sec.set("%.1f" % float(iv.get("sec", INTRO_SEC)))
             self.env = {"A": None, "B": None}
+            if self.single:
+                self._start_wave()
             self.refresh_cutlist()
             self.seek(self.trim_start)
             self.update_ui()
@@ -2950,6 +3737,10 @@ class App(tk.Tk):
             self._on_export_done(msg[1], msg[2])
         elif kind == "match":
             self._on_match_done(msg[1], msg[2], msg[3], msg[4])
+        elif kind == "wave_prog":
+            self._on_wave_prog(msg[1], msg[2])
+        elif kind == "wave":
+            self._on_wave(msg[1], msg[2])
 
     def _pump(self):
         # 한 건이 실패해도 나머지를 계속 처리하고, 무슨 일이 있어도 다음 차례를
@@ -3281,6 +4072,120 @@ def selftest():
                 ExportJob._vf_base(pf, a_clip["vf_pre"]).index("scale="))
     ok &= check("원본 크기를 안 알려줘도 동작(16:9 가정)",
                 "rotate=" in cam_vf(fine=3))
+
+    # 8) 싱글캠 — 앞뒤 자르기 + 곡 제목 인트로
+    solo = compute_segments(12.0, 102.0, [], "A")
+    ok &= check("싱글캠: 자른 구간 전체가 장면 하나", solo == [(12.0, 102.0, "A")])
+    iv = {"title": "곡 제목", "composer": "작곡가", "sec": 3.0}
+
+    def solo_plan(seg, s, e, intro, fi=1.0, fo=2.0):
+        return build_plan(seg, "a.mp4", None, 0.0, s, e, 640, 360, "30", 30.0, [], "A",
+                          "o.mp4", tmpdir="t", fade_in=fi, fade_out=fo, intro=intro)
+
+    plain = solo_plan(solo, 12.0, 102.0, None)
+    ok &= check("카메라 B 없이도 계획이 만들어짐",
+                [x["kind"] for x in plain["segments"]] == ["clip"] and
+                abs(plain["audio_start"] - 12.0) < 1e-9)
+    ps = solo_plan(solo, 12.0, 102.0, iv)
+    ok &= check("인트로는 첫 조각으로 떨어져 나옴",
+                [x["kind"] for x in ps["segments"]] == ["intro", "clip"])
+    ok &= check("인트로 길이 = 3초", ps["segments"][0]["frames"] == 90,
+                "%d프레임" % ps["segments"][0]["frames"])
+    tot, worst = walk(ps, 30.0, 0.0, 12.0)
+    ok &= check("인트로를 넣어도 길이·원본 시각이 그대로", tot == 2700 and worst < 1e-9,
+                "총 %d프레임, 최대 어긋남 %.3g초" % (tot, worst))
+    ok &= check("인트로를 넣어도 소리 시작 위치가 그대로",
+                abs(ps["audio_start"] - plain["audio_start"]) < 1e-9 and
+                abs(ps["total_duration"] - 90.0) < 1e-9)
+    ok &= check("시작 페이드는 인트로에, 끝 페이드는 본편에",
+                ps["segments"][0].get("fade_in") == 1.0 and
+                "fade_out" not in ps["segments"][0] and
+                "fade_in" not in ps["segments"][1] and
+                ps["segments"][1].get("fade_out") == 2.0)
+
+    ps2 = solo_plan(compute_segments(0.0, 2.0, [], "A"), 0.0, 2.0, iv, fi=0.5, fo=0.5)
+    ok &= check("영상이 인트로보다 짧으면 전체가 인트로",
+                [(x["kind"], x["frames"]) for x in ps2["segments"]] == [("intro", 60)] and
+                ps2["segments"][0].get("fade_out") == 0.5)
+    ps3 = solo_plan(solo, 12.0, 102.0, iv, fi=5.0)
+    ok &= check("인트로보다 긴 시작 페이드는 소리도 같이 잘림",
+                ps3["segments"][0].get("fade_in") == 3.0 and ps3["audio_fade_in"] == 3.0)
+    ok &= check("인트로가 없으면 멀티캠 계획은 예전 그대로",
+                [x["kind"] for x in hard["segments"]] == ["clip"] * 4 and
+                "label" not in hard["segments"][0])
+
+    ok &= check("인트로 세기: 시작과 유지 구간은 1",
+                intro_level(0.0, 3.0) == 1.0 and intro_level(2.4, 3.0) == 1.0)
+    ok &= check("인트로 세기: 끝에서 서서히 0으로",
+                abs(intro_level(2.7, 3.0) - 0.5) < 1e-9 and intro_level(3.0, 3.0) == 0.0)
+    ok &= check("인트로 세기: 구간 밖은 0", intro_level(-0.5, 3.0) == 0.0)
+    ok &= check("짧은 인트로는 걷히는 시간도 줄어듦", abs(intro_out_sec(1.0) - 1 / 3.0) < 1e-9)
+
+    g = intro_graph("BASE", 1280, 720, 3.0, fade_in=1.0)
+    ok &= check("인트로 그래프: 블러 뒤에 글자를 얹고 페이드는 맨 끝",
+                g.index("gblur") < g.index("[bg][text]overlay") < g.index("fade=t=in"))
+    ok &= check("인트로 그래프: 블러와 글자가 같은 시각에 걷힘",
+                g.count("fade=t=out:st=2.400000:d=0.600000:alpha=1") == 2)
+    ok &= check("페이드가 없으면 그래프에도 없음", "fade=t=in" not in intro_graph("B", 640, 360, 3.0))
+
+    def letters_box(*args):
+        return render_intro_layer(*args).getchannel("A").getbbox()
+
+    bx = letters_box(1280, 720, "곡 제목", "작곡가")
+    ok &= check("글자가 화면 한가운데 놓임",
+                abs((bx[0] + bx[2]) / 2.0 - 640) < 20 and abs((bx[1] + bx[3]) / 2.0 - 360) < 20,
+                str(bx))
+    ok &= check("제목이 비어도 작곡가만 그려짐", letters_box(1280, 720, "", "작곡가") is not None)
+    ok &= check("둘 다 비면 아무것도 안 그려짐", letters_box(1280, 720, "", "") is None)
+    bl = letters_box(1280, 720, "아주 긴 곡 제목 " * 12, "작곡가")
+    ok &= check("긴 제목도 화면 폭 안에서 줄이 바뀜", bl[0] > 0 and bl[2] < 1280, str(bl))
+    bl2 = letters_box(1280, 720, "띄어쓰기없는아주긴제목" * 8, "")
+    ok &= check("띄어쓰기가 없어도 화면 폭을 넘지 않음", bl2[0] > 0 and bl2[2] < 1280, str(bl2))
+    bv = letters_box(1080, 1920, "세로 영상 제목", "작곡가")
+    ok &= check("세로 화면에서도 폭 안에 들어감", bv[0] > 0 and bv[2] < 1080, str(bv))
+
+    # 9) 인트로 실제 변환 — 필터 그래프는 ffmpeg 이 직접 돌려 봐야 안다
+    ff_, fp_ = find_tool("ffmpeg"), find_tool("ffprobe")
+    if ff_ and fp_:
+        import tempfile
+        work = tempfile.mkdtemp(prefix="multicam_test_")
+        try:
+            src = os.path.join(work, "src.mp4")
+            subprocess.run([ff_, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=7",
+                            "-f", "lavfi", "-i", "sine=f=440:d=7",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", src], capture_output=True, **_hidden_kwargs())
+            out = os.path.join(work, "out.mp4")
+            vargs = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p"]
+            real = build_plan(compute_segments(1.0, 6.0, [], "A"), src, None, 0.0, 1.0, 6.0,
+                              320, 180, "30", 30.0, vargs, "A", out,
+                              tmpdir=os.path.join(work, "tmp"), fade_in=0.5, fade_out=0.5,
+                              intro={"title": "테스트: '곡' 100%", "composer": "작곡가", "sec": 2.0})
+            result = []
+            ExportJob(ff_, real, lambda f, m: None,
+                      lambda good, msg: result.append((good, msg)))._run()
+            ok &= check("인트로 넣은 영상 변환 성공", bool(result) and result[0][0],
+                        "" if result and result[0][0] else str(result)[:300])
+            if result and result[0][0]:
+                n = subprocess.run([fp_, "-v", "error", "-count_frames", "-select_streams", "v:0",
+                                    "-show_entries", "stream=nb_read_frames",
+                                    "-of", "csv=p=0", out], capture_output=True,
+                                   **_hidden_kwargs()).stdout.decode("ascii", "replace")
+                ok &= check("변환 결과 프레임 수 = 5초 x 30", n.strip().strip(",") == "150", n.strip())
+
+                def edges(t):
+                    # 글자가 놓이는 가운데를 빼고 재면 순수하게 배경의 선명도만 남는다
+                    img = grab_frame(ff_, out, t, 320, lossless=True)
+                    a = np.asarray(img.convert("L")).astype(np.float64)[:50]
+                    return float(np.abs(np.diff(a, axis=1)).mean())
+
+                ok &= check("인트로 동안만 배경이 흐림", edges(1.0) < edges(3.0) * 0.5,
+                            "인트로 %.2f / 본편 %.2f" % (edges(1.0), edges(3.0)))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    else:
+        print("  건너뜀  인트로 실제 변환 (ffmpeg 없음)")
 
     print("\n자체 점검:", "전체 통과" if ok else "실패 있음")
     return 0 if ok else 1
