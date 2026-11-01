@@ -632,10 +632,11 @@ class FrameBuf(object):
 class AudioOut(object):
     """ffmpeg 로 뽑은 PCM 을 사운드카드로 내보내고, 재생 위치를 알려준다."""
 
-    def __init__(self, ffmpeg, path, start, stop_evt):
+    def __init__(self, ffmpeg, path, start, stop_evt, denoise=None):
         """ffmpeg 디코딩만 먼저 띄운다. 실제 소리 출력은 open() 에서 시작.
         영상 디코딩이 준비되는 동안 오디오 디코딩도 같이 돌게 해서
-        재생 버튼을 누른 뒤 기다리는 시간을 줄인다."""
+        재생 버튼을 누른 뒤 기다리는 시간을 줄인다.
+        denoise: 노이즈 제거 설정 — 내보낼 소리를 미리 들을 수 있게 같은 필터를 쓴다."""
         import sounddevice as sd
         self.sd = sd
         self.stop_evt = stop_evt
@@ -655,10 +656,14 @@ class AudioOut(object):
         self.eof = False
         self.done = False
 
+        if denoise:
+            src = denoise_inputs(path, start, denoise)
+            src += ["-filter_complex", denoise_graph(0, denoise), "-map", "[a]"]
+        else:
+            src = ["-ss", "%.6f" % max(0.0, start), "-i", path, "-vn"]
         self.proc = subprocess.Popen(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-             "-ss", "%.6f" % max(0.0, start), "-i", path,
-             "-vn", "-ac", str(self.ch), "-ar", str(self.sr), "-f", "s16le", "-"],
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"] + src +
+            ["-ac", str(self.ch), "-ar", str(self.sr), "-f", "s16le", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **_hidden_kwargs())
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -797,7 +802,7 @@ class Player(object):
         """
         sources: {'A': (경로, 이 카메라에서 읽기 시작할 시각), ...}
                  시각이 음수면 0 으로 당기고 첫 프레임의 기준시각을 보정한다.
-        audio:   (경로, 읽기 시작할 시각) 또는 None
+        audio:   (경로, 읽기 시작할 시각, 노이즈 제거 설정 또는 None) 또는 None
         filters: {'A': '보정 필터 문자열', ...} — 크기 맞춤 앞에 붙는다
         """
         filters = filters or {}
@@ -835,7 +840,7 @@ class Player(object):
         pending = None
         if audio:
             try:
-                pending = AudioOut(self.ff, audio[0], audio[1], self.stop_evt)
+                pending = AudioOut(self.ff, audio[0], audio[1], self.stop_evt, audio[2])
             except ImportError:
                 self.audio_error = "소리 재생 모듈(sounddevice)이 없습니다 — setup.bat 을 다시 실행하세요"
             except Exception as e:
@@ -1095,8 +1100,8 @@ INTRO_FONTS = {True: ("malgunbd.ttf", "AppleSDGothicNeo.ttc",
                False: ("malgun.ttf", "AppleSDGothicNeo.ttc",
                        "NotoSansCJK-Regular.ttc", "NanumGothic.ttf")}
 
-TITLE_FONT_DEFAULT = "기본 글꼴"    # 곡 제목 글꼴 칸의 첫 항목
-TITLE_SIZE_MIN, TITLE_SIZE_MAX = 30, 300     # 곡 제목 크기(%)
+INTRO_FONT_DEFAULT = "기본 글꼴"    # 곡 제목·작곡가 글꼴 칸의 첫 항목
+INTRO_SIZE_MIN, INTRO_SIZE_MAX = 30, 300     # 곡 제목·작곡가 크기(%)
 FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc")
 NO_HANGUL_MARK = " (한글 없음)"     # 글꼴 목록에서 한글을 못 쓰는 글꼴 표시
 
@@ -1283,22 +1288,25 @@ def _fit_text(text, px, bold, max_w, face=None):
     return font, lines
 
 
-def render_intro_layer(w, h, title, composer, face=None, scale=1.0):
+def render_intro_layer(w, h, title, composer, face=None, scale=1.0,
+                       composer_face=None, composer_scale=1.0):
     """
     곡 제목·작곡가만 그린 투명 그림(RGBA). 내보내기와 미리보기가 같은 그림을 쓴다.
 
-    face, scale 은 곡 제목에만 적용한다. 고른 글꼴에 없는 글자가 있으면 그 글자가 네모로
-    나오므로 곡 제목 전체를 기본 글꼴로 그린다 (알림은 화면 쪽에서 띄운다).
+    글꼴과 크기는 곡 제목(face, scale)과 작곡가(composer_face, composer_scale)가 따로다.
+    고른 글꼴에 없는 글자가 있으면 그 글자가 네모로 나오므로 그쪽만 기본 글꼴로 그린다
+    (알림은 화면 쪽에서 띄운다).
     """
     from PIL import Image, ImageDraw, ImageFilter
     st = intro_style(w, h)
-    if face and font_missing_chars(face, title):
-        face = None
     blocks = []
-    for text, px, bold, alpha, chosen in ((title, st["title_px"] * scale, True, 255, face),
-                                          (composer, st["composer_px"], False, 235, None)):
+    for text, px, bold, alpha, chosen in (
+            (title, st["title_px"] * scale, True, 255, face),
+            (composer, st["composer_px"] * composer_scale, False, 235, composer_face)):
         text = (text or "").strip()
         if text:
+            if chosen and font_missing_chars(chosen, text):
+                chosen = None
             font, lines = _fit_text(text, px, bold, st["max_w"], chosen)
             blocks.append((font, lines, int(getattr(font, "size", px) * 1.3), alpha))
 
@@ -1351,11 +1359,111 @@ def intro_graph(base, w, h, sec, fade_in=0.0, fade_out=0.0):
             % (base, st["blur"], dim, at, d, at, d, end))
 
 
+# 노이즈 제거 — 곡이 아닌 구간에서 노이즈 모양을 배워 일정하게 깔리는 소리를 줄인다
+DENOISE_OFF = "끔"
+# 강도: (줄이는 양 dB, 필터 기준값을 잰 노이즈 크기보다 얼마나 높일지 dB)
+# 합성 소리 시험에서 '약' 은 노이즈가 약 6dB, '중' 은 약 11dB 줄었다. 기준값을 더 높이면
+# 더 줄지만 작게 연주하는 부분까지 함께 깎인다.
+DENOISE_LEVELS = {"약": (12, 0.0), "중": (12, 5.0)}
+DENOISE_LABELS = [DENOISE_OFF, "약", "중"]
+DENOISE_DELAY = 0.025             # afftdn 을 거치면 소리가 이만큼 늦어진다 (자체 점검에서 확인)
+NOISE_SAMPLE_SEC, NOISE_SAMPLE_MIN = 1.5, 0.5   # 노이즈 표본 길이(초)
+NOISE_SILENT = 1e-4               # 이보다 작으면 노이즈가 아니라 디지털 무음이다
+NOISE_GAP_CUT, NOISE_GAP_WHOLE = 10.0, 20.0     # 표본이 곡보다 이만큼(dB) 조용해야 믿는다
+
+
+def _quiet_stretch(env, hop, lo, hi, want, np):
+    """env 의 lo~hi 초에서 want 초 동안 가장 조용한 곳. (크기, 시작초) 또는 None"""
+    i0, i1 = max(0, int(lo / hop)), min(len(env), int(hi / hop))
+    n = int(want / hop)
+    if n < 1 or i1 - i0 < n:
+        return None
+    seg = env[i0:i1]
+    power = np.concatenate(([0.0], np.cumsum(seg * seg)))
+    power = (power[n:] - power[:-n]) / n
+    dead = np.concatenate(([0], np.cumsum(seg < NOISE_SILENT)))
+    power = np.where(dead[n:] - dead[:-n] == 0, power, np.inf)
+    k = int(np.argmin(power))
+    if not np.isfinite(power[k]):
+        return None
+    return math.sqrt(power[k]), (i0 + k) * hop
+
+
+def find_noise_window(env, hop, song_lo, song_hi, np):
+    """
+    노이즈를 배울 구간 (시작초, 길이초). 믿을 만한 곳이 없으면 None.
+
+    곡으로 남기지 않는 앞뒤에서 가장 조용한 곳을 고른다. 사용자가 직접 곡이 아니라고 잘라 낸
+    부분이니 연주를 노이즈로 착각할 위험이 적다. 잘라 낸 부분이 너무 짧으면 파일 전체에서
+    찾되, 잔잔한 연주를 잘못 고르지 않도록 더 엄격하게 본다.
+    """
+    total = len(env) * hop
+    song_lo, song_hi = max(0.0, song_lo), min(total, song_hi)
+    song = env[int(song_lo / hop):int(song_hi / hop)]
+    if len(song) == 0:
+        return None
+    loud = float(np.percentile(song, 90))
+
+    best = None
+    for lo, hi in ((0.0, song_lo), (song_hi, total)):
+        want = min(NOISE_SAMPLE_SEC, hi - lo)
+        hit = _quiet_stretch(env, hop, lo, hi, want, np) if want >= NOISE_SAMPLE_MIN else None
+        if hit and (best is None or hit[0] < best[0]):
+            best = (hit[0], hit[1], want)
+    gap = NOISE_GAP_CUT
+    if best is None:
+        hit = _quiet_stretch(env, hop, 0.0, total, NOISE_SAMPLE_SEC, np)
+        best = (hit[0], hit[1], NOISE_SAMPLE_SEC) if hit else None
+        gap = NOISE_GAP_WHOLE
+    if best is None or loud <= 0 or 20 * math.log10(best[0] / loud) > -gap:
+        return None
+    return best[1], best[2]
+
+
+def measure_db(ffmpeg, path, start, dur, np):
+    """이 구간 소리의 크기(dB). 필터가 보는 값과 맞도록 채널을 섞지 않고 잰다. 실패하면 None."""
+    out = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                          "-ss", "%.6f" % start, "-i", path, "-t", "%.6f" % dur,
+                          "-vn", "-f", "f32le", "-"], capture_output=True, **_hidden_kwargs())
+    x = np.frombuffer(out.stdout, dtype="<f4").astype(np.float64)
+    if len(x) == 0:
+        return None
+    rms = float(np.sqrt(np.mean(x * x)))
+    return 20 * math.log10(rms) if rms > 0 else None
+
+
+def denoise_inputs(path, start, dn):
+    """노이즈 표본과 본 소리를 입력 두 개로 연다. 표본은 넉넉히 읽고 그래프에서 정확히 자른다."""
+    return ["-ss", "%.6f" % dn["start"], "-t", "%.6f" % (dn["len"] + 0.5), "-i", path,
+            "-ss", "%.6f" % max(0.0, start), "-i", path]
+
+
+def denoise_graph(first, dn, tail=""):
+    """
+    노이즈 제거 필터 그래프. first = 표본 입력의 번호, 출력 이름은 [a], tail = 끝에 붙일 필터.
+
+    표본을 곡 앞에 이어 붙여 필터가 먼저 노이즈를 배우게 한 뒤 그 부분을 잘라 낸다. 그래서
+    표본이 곡과 멀리 떨어져 있어도 그 사이를 읽을 필요가 없다. 기준값(nf)이 실제 노이즈
+    크기와 맞지 않으면 필터가 아무 일도 하지 않으므로 잰 값으로 정한다.
+
+    표본 길이는 여기서 샘플 단위로 잘라 맞춘다. 압축 소리는 프레임(약 20ms) 단위로 읽혀서
+    입력의 -t 만으로는 길이가 어긋나고, 그만큼 소리가 영상보다 밀리거나 앞당겨진다.
+    """
+    nr, raise_db = DENOISE_LEVELS[dn["level"]]
+    return ("[%d:a]asetpts=PTS-STARTPTS,atrim=end=%.6f[sample];"
+            "[sample][%d:a]concat=n=2:v=0:a=1,"
+            "asendcmd=c='0 afftdn sn start',asendcmd=c='%.3f afftdn sn stop',"
+            "afftdn=nr=%g:nf=%.1f,atrim=start=%.6f,asetpts=PTS-STARTPTS%s[a]"
+            % (first, dn["len"], first + 1, dn["len"], nr,
+               max(-80.0, min(-20.0, dn["db"] + raise_db)),
+               dn["len"] + DENOISE_DELAY, ("," + tail) if tail else ""))
+
+
 def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
                width, height, fps_str, fps, vcodec_args, audio_cam, output,
                tmpdir=None, fade_in=0.0, fade_out=0.0,
                trans_mode="none", trans_sec=0.0, adjust=None, sizes=None,
-               intro=None):
+               intro=None, denoise=None):
     """
     내보내기 작업 명세를 만든다. B 카메라 시간 = A 시간 + offset.
 
@@ -1365,6 +1473,7 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
     adjust     : 카메라별 화면 보정 {'A': {'rot':0,'fine':0,'sharp':0.0,'sat':1.0}, ...}
     sizes      : 카메라별 원본 크기 {'A': (가로, 세로), ...} — 미세 각도 확대율 계산용
     intro      : 제목 인트로 {'title':..., 'composer':..., 'sec':...} 또는 None
+    denoise    : 노이즈 제거 {'start', 'len', 'db', 'level'} 또는 None
     """
     paths = {"A": path_a, "B": path_b}
     sizes = sizes or {}
@@ -1432,7 +1541,9 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
                              title=intro.get("title", ""),
                              composer=intro.get("composer", ""),
                              title_font=intro.get("font"),
-                             title_scale=intro.get("scale", 1.0))
+                             title_scale=intro.get("scale", 1.0),
+                             composer_font=intro.get("composer_font"),
+                             composer_scale=intro.get("composer_scale", 1.0))
             if n < first["frames"]:
                 head_item.pop("fade_out", None)
                 body = dict(first, frames=first["frames"] - n,
@@ -1457,7 +1568,7 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
     if items and items[0]["kind"] == "intro":
         # 영상 페이드가 인트로 길이로 잘렸으면 소리도 같은 길이로 맞춘다
         a_fade_in = min(a_fade_in, items[0]["frames"] / float(fps))
-    return {
+    plan = {
         "segments": items,
         "width": (width // 2) * 2, "height": (height // 2) * 2,
         "fps_str": fps_str,
@@ -1471,6 +1582,9 @@ def build_plan(segs, path_a, path_b, offset, trim_start, trim_end,
         "tmpdir": tmpdir or os.path.join(os.path.dirname(output) or ".",
                                          "._multicam_tmp_%d" % int(time.time() * 1000)),
     }
+    if denoise:
+        plan["denoise"] = denoise
+    return plan
 
 
 # ----------------------------------------------------------------------------
@@ -1534,13 +1648,8 @@ class ExportJob(object):
             if self.cancelled:
                 raise KeyboardInterrupt
 
-            self.on_progress(0.96, "소리 입히는 중...")
-            cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
-                   "-i", silent,
-                   "-ss", "%.6f" % p["audio_start"], "-i", p["audio_path"],
-                   "-map", "0:v:0", "-map", "1:a:0",
-                   "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-ac", "2",
-                   "-t", "%.6f" % p["total_duration"]]
+            dn = p.get("denoise")
+            self.on_progress(0.96, "노이즈 줄이고 소리 입히는 중..." if dn else "소리 입히는 중...")
             # 화면이 검정에서 밝아지는 동안 소리도 같이 커지고, 끝에서 같이 잦아든다
             af = []
             total = p["total_duration"]
@@ -1549,7 +1658,19 @@ class ExportJob(object):
             if p.get("audio_fade_out", 0) > 0:
                 d = min(p["audio_fade_out"], total)
                 af.append("afade=t=out:st=%.6f:d=%.6f" % (max(0.0, total - d), d))
-            if af:
+
+            cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                   "-i", silent]
+            if dn:                    # 페이드는 표본을 잘라 낸 뒤에 걸어야 해서 그래프 안에 넣는다
+                cmd += denoise_inputs(p["audio_path"], p["audio_start"], dn)
+                cmd += ["-filter_complex", denoise_graph(1, dn, ",".join(af)),
+                        "-map", "0:v:0", "-map", "[a]"]
+            else:
+                cmd += ["-ss", "%.6f" % p["audio_start"], "-i", p["audio_path"],
+                        "-map", "0:v:0", "-map", "1:a:0"]
+            cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-ac", "2",
+                    "-t", "%.6f" % total]
+            if af and not dn:
                 cmd += ["-af", ",".join(af)]
             cmd += ["-movflags", "+faststart", p["output"]]
             self._run_ff(cmd)
@@ -1582,7 +1703,8 @@ class ExportJob(object):
             layer = os.path.join(p["tmpdir"], "intro_%04d.png" % idx)
             render_intro_layer(p["width"], p["height"],
                                seg.get("title", ""), seg.get("composer", ""),
-                               seg.get("title_font"), seg.get("title_scale", 1.0)).save(layer)
+                               seg.get("title_font"), seg.get("title_scale", 1.0),
+                               seg.get("composer_font"), seg.get("composer_scale", 1.0)).save(layer)
             fc = intro_graph(base, p["width"], p["height"], dur,
                              seg.get("fade_in", 0.0), seg.get("fade_out", 0.0))
             cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -1744,7 +1866,8 @@ class App(tk.Tk):
         self._adj_after = None       # 화면 보정 값 변경을 몰아서 반영하기 위한 예약
         self._matching = False       # 두 화면 맞추기 분석 중
         self._can_expose = self._has_filter("exposure")
-        self._wave_token = 0         # 싱글캠 파형 분석 — 다른 영상을 열면 옛 결과를 버린다
+        self._wave_token = {"A": 0, "B": 0}   # 파형 분석 — 다른 영상을 열면 옛 결과를 버린다
+        self._noise_cache = None     # 노이즈 표본 ((경로, 곡 시작, 곡 끝), 표본 또는 None)
         self._play_tail = False      # 끝점 뒤(잘려나갈 부분)를 듣는 중
         self._tl_drag = None         # 타임라인에서 끌고 있는 손잡이 ('in' / 'out')
         self._intro_after = None     # 제목 입력을 몰아서 반영하기 위한 예약
@@ -2196,27 +2319,35 @@ class App(tk.Tk):
             ie.bind("<Return>", lambda ev: self.focus_set())
             var.trace_add("write", lambda *a: self.on_intro())
 
-        # 곡 제목 글꼴 — 목록은 싱글캠에 처음 들어올 때 뒤에서 읽어 채운다 (_load_font_list)
-        ttk.Label(introbox, text="글꼴").grid(row=1, column=0, sticky="w", pady=P(1))
-        fr = ttk.Frame(introbox)
-        fr.grid(row=1, column=1, sticky="ew", padx=(P(6), 0), pady=P(1))
-        fr.columnconfigure(0, weight=1)
-        self.var_font = tk.StringVar(value=TITLE_FONT_DEFAULT)
-        self._cb_font = ttk.Combobox(fr, textvariable=self.var_font, state="readonly",
-                                     style="Font.TCombobox",
-                                     values=[TITLE_FONT_DEFAULT], width=14, height=18)
-        self._cb_font.grid(row=0, column=0, sticky="ew")
-        self._cb_font.bind("<<ComboboxSelected>>", lambda ev: self.focus_set())
-        self.var_font.trace_add("write", lambda *a: self.on_intro())
-        ttk.Label(fr, text="크기", style="Muted.TLabel").grid(row=0, column=1, padx=(P(6), P(3)))
+        # 글꼴과 크기는 곡 제목과 작곡가가 따로다.
+        # 글꼴 목록은 싱글캠에 처음 들어올 때 뒤에서 읽어 채운다 (_load_font_list).
+        def font_row(row_no, var, size_var):
+            ttk.Label(introbox, text="글꼴").grid(row=row_no, column=0, sticky="w", pady=P(1))
+            fr = ttk.Frame(introbox)
+            fr.grid(row=row_no, column=1, sticky="ew", padx=(P(6), 0), pady=P(1))
+            fr.columnconfigure(0, weight=1)
+            cb = ttk.Combobox(fr, textvariable=var, state="readonly", style="Font.TCombobox",
+                              values=[INTRO_FONT_DEFAULT], width=14, height=18)
+            cb.grid(row=0, column=0, sticky="ew")
+            cb.bind("<<ComboboxSelected>>", lambda ev: self.focus_set())
+            var.trace_add("write", lambda *a: self.on_intro())
+            ttk.Label(fr, text="크기", style="Muted.TLabel").grid(row=0, column=1,
+                                                                 padx=(P(6), P(3)))
+            ttk.Spinbox(fr, from_=INTRO_SIZE_MIN, to=INTRO_SIZE_MAX, increment=10, width=4,
+                        textvariable=size_var, command=self.on_intro).grid(row=0, column=2)
+            ttk.Label(fr, text="%", style="Muted.TLabel").grid(row=0, column=3, padx=(P(2), 0))
+            size_var.trace_add("write", lambda *a: self.on_intro())
+            return cb
+
+        self.var_font = tk.StringVar(value=INTRO_FONT_DEFAULT)
         self.var_title_size = tk.StringVar(value="100")
-        ttk.Spinbox(fr, from_=TITLE_SIZE_MIN, to=TITLE_SIZE_MAX, increment=10, width=4,
-                    textvariable=self.var_title_size, command=self.on_intro).grid(row=0, column=2)
-        ttk.Label(fr, text="%", style="Muted.TLabel").grid(row=0, column=3, padx=(P(2), 0))
-        self.var_title_size.trace_add("write", lambda *a: self.on_intro())
+        self._cb_font = font_row(1, self.var_font, self.var_title_size)
+        self.var_composer_font = tk.StringVar(value=INTRO_FONT_DEFAULT)
+        self.var_composer_size = tk.StringVar(value="100")
+        self._cb_composer_font = font_row(3, self.var_composer_font, self.var_composer_size)
 
         ir = ttk.Frame(introbox)
-        ir.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(P(5), 0))
+        ir.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(P(5), 0))
         ttk.Checkbutton(ir, text="넣기", variable=self.var_intro,
                         command=self.on_intro).pack(side="left")
         ttk.Label(ir, text="길이", style="Muted.TLabel").pack(side="left", padx=(P(8), P(3)))
@@ -2269,7 +2400,12 @@ class App(tk.Tk):
         self.var_audio = tk.StringVar(value="A")
         self._audio_box = ttk.Frame(row)     # 싱글캠에서는 고를 게 없어 통째로 숨긴다
         self._audio_box.pack(side="left")
-        combo("소리", self.var_audio, 12, ["A", "B"], self._audio_box)
+        cba = combo("소리", self.var_audio, 12, ["A", "B"], self._audio_box)
+        cba.bind("<<ComboboxSelected>>", lambda ev: self.on_denoise(), add="+")
+
+        self.var_denoise = tk.StringVar(value=DENOISE_OFF)
+        cbd = combo("노이즈 제거", self.var_denoise, 4, DENOISE_LABELS)
+        cbd.bind("<<ComboboxSelected>>", lambda ev: self.on_denoise(), add="+")
 
         self.var_q = tk.StringVar(value="표준")
         combo("화질", self.var_q, 12, ["고화질(느림)", "표준", "가벼움(빠름)"])
@@ -2620,7 +2756,7 @@ class App(tk.Tk):
     # -- 곡 제목 인트로 (싱글캠) ------------------------------------------------
 
     def intro_settings(self):
-        """인트로를 넣을 거면 {'title', 'composer', 'sec', 'font', 'scale'}, 아니면 None."""
+        """인트로를 넣을 거면 제목·작곡가와 길이, 각각의 글꼴·크기를 담은 dict, 아니면 None."""
         if not (self.single and self.var_intro.get()):
             return None
         title = self.var_title.get().strip()
@@ -2628,11 +2764,16 @@ class App(tk.Tk):
         if not (title or composer):
             return None
         sec = self._fnum(self.var_intro_sec, INTRO_SEC)
-        size = self._fnum(self.var_title_size, 100.0)
         return {"title": title, "composer": composer,
                 "sec": max(INTRO_SEC_MIN, min(INTRO_SEC_MAX, sec)),
                 "font": self._font_map.get(self.var_font.get()),
-                "scale": max(TITLE_SIZE_MIN, min(TITLE_SIZE_MAX, size)) / 100.0}
+                "scale": self._size_scale(self.var_title_size),
+                "composer_font": self._font_map.get(self.var_composer_font.get()),
+                "composer_scale": self._size_scale(self.var_composer_size)}
+
+    def _size_scale(self, var):
+        """크기 칸(%)의 값을 배율로. 이상한 값이면 100%."""
+        return max(INTRO_SIZE_MIN, min(INTRO_SIZE_MAX, self._fnum(var, 100.0))) / 100.0
 
     def _load_font_list(self):
         """설치된 글꼴을 한 번만, 화면을 막지 않게 뒤에서 읽는다."""
@@ -2651,34 +2792,46 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_fonts(self, fonts):
-        names = [TITLE_FONT_DEFAULT]
+        names = [INTRO_FONT_DEFAULT]
         for name, path, index in fonts:
             self._font_map.setdefault(name, (path, index))
             names.append(name)
-        chosen = self.var_font.get()
-        if chosen not in names:       # 프로젝트에서 불러온, 지금은 목록에 없는 글꼴
-            names.insert(1, chosen)
-        self._cb_font.configure(values=names)
+        for var, cb in ((self.var_font, self._cb_font),
+                        (self.var_composer_font, self._cb_composer_font)):
+            # 프로젝트에서 불러온, 지금은 목록에 없는 글꼴도 칸에 남긴다
+            cb.configure(values=names if var.get() in names
+                         else names[:1] + [var.get()] + names[1:])
 
-    def _restore_font(self, saved):
+    def _font_record(self, var):
+        """프로젝트에 저장할 글꼴 정보 [이름, 파일 경로, 글꼴 번호]. 기본 글꼴이면 None."""
+        face = self._font_map.get(var.get())
+        return ([var.get()] + list(face)) if face else None
+
+    def _restore_font(self, var, saved):
         """프로젝트에 저장된 글꼴을 되살린다. 파일을 찾지 못하면 기본 글꼴로 두고 False."""
         if saved and os.path.exists(saved[1]):
             self._font_map[saved[0]] = (saved[1], int(saved[2]))
-            self.var_font.set(saved[0])
+            var.set(saved[0])
             return True
-        self.var_font.set(TITLE_FONT_DEFAULT)
+        var.set(INTRO_FONT_DEFAULT)
         return not saved
 
-    def _check_title_font(self):
-        """고른 글꼴에 제목 글자가 없어 기본 글꼴로 나갈 때 그 이유를 상태줄에 알린다."""
+    def _check_intro_fonts(self):
+        """고른 글꼴에 글자가 없어 기본 글꼴로 나갈 때 그 이유를 상태줄에 알린다."""
         iv = self.intro_settings()
-        lack = font_missing_chars(iv["font"], iv["title"]) if iv and iv["font"] else []
-        if lack:
-            self.prog_lbl.configure(text="이 글꼴에 없는 글자가 있어 곡 제목은 기본 글꼴로 나갑니다: "
-                                         + " ".join(lack[:8]))
+        notes = []
+        if iv:
+            for label, text, face in (("곡 제목", iv["title"], iv["font"]),
+                                      ("작곡가", iv["composer"], iv["composer_font"])):
+                lack = font_missing_chars(face, text) if face else []
+                if lack:
+                    notes.append("%s(%s)" % (label, " ".join(lack[:8])))
+        if notes:
+            self.prog_lbl.configure(text="고른 글꼴에 없는 글자가 있어 기본 글꼴로 나갑니다: "
+                                         + ", ".join(notes))
         elif self._font_warned:
             self.prog_lbl.configure(text="")
-        self._font_warned = bool(lack)
+        self._font_warned = bool(notes)
 
     def on_intro(self, *a):
         """글자를 칠 때마다 다시 그리지 않도록 잠깐 모아서 반영."""
@@ -2689,7 +2842,7 @@ class App(tk.Tk):
 
     def _apply_intro_change(self):
         self._intro_after = None
-        self._check_title_font()
+        self._check_intro_fonts()
         if self._playing or not self.ready:
             return
         # 고친 결과가 바로 보이도록 인트로가 안 보이는 위치면 그 자리로 옮긴다
@@ -2718,10 +2871,11 @@ class App(tk.Tk):
     def _intro_letters(self, iv, w, h):
         """글자 그림에서 글자가 있는 부분만 오려 둔다. (색, 투명도, 위치)
         재생 중에는 매 프레임 쓰므로 내용과 크기가 그대로면 다시 그리지 않는다."""
-        key = (iv["title"], iv["composer"], w, h, iv["font"], iv["scale"])
+        looks = (iv["font"], iv["scale"], iv["composer_font"], iv["composer_scale"])
+        key = (iv["title"], iv["composer"], w, h) + looks
         if self._intro_cache and self._intro_cache[0] == key:
             return self._intro_cache[1]
-        layer = render_intro_layer(w, h, iv["title"], iv["composer"], iv["font"], iv["scale"])
+        layer = render_intro_layer(w, h, iv["title"], iv["composer"], *looks)
         box = layer.getchannel("A").getbbox() or (0, 0, 1, 1)
         cut = layer.crop(box)
         made = (cut.convert("RGB"), cut.getchannel("A"), (box[0], box[1]))
@@ -2989,8 +3143,8 @@ class App(tk.Tk):
             text="%s   ·   %dx%d  %.2ffps  %s"
                  % (info.name, info.width, info.height, info.fps, fmt_time(info.duration)))
         self.env[cam] = None
+        self._wave_token[cam] += 1    # 옛 영상의 파형이 뒤늦게 도착해도 버리도록
         if cam == "A":
-            self._wave_token += 1     # 옛 영상의 파형이 뒤늦게 도착해도 버리도록
             # 싱글캠은 다른 영상에 맞출 일이 없다. 세로 영상도 세로 그대로 내보낸다.
             self.var_res.set(SAME_LABEL[self.mode] if self.single or info.width >= 1280
                              else "1920x1080 (FHD)")
@@ -3000,52 +3154,121 @@ class App(tk.Tk):
                 self._start_wave()
             elif not info.has_audio or not self.info["A" if cam == "B" else "B"].has_audio:
                 self.sync_lbl.configure(text="한쪽에 소리가 없어 자동 싱크 불가 — 직접 입력하세요")
+        if self.var_denoise.get() != DENOISE_OFF and self.ready:
+            self.on_denoise()
         self.update_ui()
         self.refresh_preview()
 
-    def _start_wave(self):
+    def _start_wave(self, cam="A"):
         """
-        싱글캠에는 싱크 단계가 없어 파형을 따로 구한다. 곡이 어디서 시작하고
-        끝나는지 눈으로 찾는 데 쓴다. 긴 영상도 편집을 막지 않도록 뒤에서 돌린다.
+        싱크 없이 소리 파형을 구한다. 싱글캠에서는 곡이 어디서 시작하고 끝나는지 눈으로 찾는 데,
+        노이즈 제거에서는 조용한 구간을 찾는 데 쓴다. 긴 영상도 편집을 막지 않도록 뒤에서 돌린다.
         """
-        self._wave_token += 1
-        tok = self._wave_token
-        info = self.info["A"]
+        self._wave_token[cam] += 1
+        tok = self._wave_token[cam]
+        info = self.info[cam]
         if info is None:
             return
         if not info.has_audio:
             self.prog_lbl.configure(text="이 영상에는 소리가 없어 파형을 그릴 수 없습니다.")
             return
-        if self.env["A"] is not None:
+        if self.env[cam] is not None:
             return
 
         def work():
             try:
                 env = load_envelope(self.ff, info.path, self.np,
-                                    progress=lambda f: self._uiq.put(("wave_prog", tok, f)),
+                                    progress=lambda f: self._uiq.put(("wave_prog", cam, tok, f)),
                                     duration=info.duration)
             except Exception:
                 env = None
-            self._uiq.put(("wave", tok, env))
+            self._uiq.put(("wave", cam, tok, env))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_wave_prog(self, tok, frac):
-        if tok == self._wave_token and self.single and not self._export:
+    def _on_wave_prog(self, cam, tok, frac):
+        if tok == self._wave_token[cam] and not self._export:
             self.prog["value"] = int(frac * 1000)
             self.prog_lbl.configure(text="소리 분석 중... (편집은 계속할 수 있습니다)")
 
-    def _on_wave(self, tok, env):
-        if tok != self._wave_token:
+    def _on_wave(self, cam, tok, env):
+        if tok != self._wave_token[cam]:
             return
-        if self.single and not self._export:
-            self.prog["value"] = 0
-            self._check_title_font()  # 분석 문구가 덮어쓴 글꼴 안내가 있으면 되살린다
+        if env is not None and len(env) > 1:
+            self.env[cam] = env
+            self.redraw_timeline()
+        if self._export:
+            return
+        self.prog["value"] = 0
+        if self.single:
+            self._check_intro_fonts()  # 분석 문구가 덮어쓴 글꼴 안내가 있으면 되살린다
             if not self._font_warned:
                 self.prog_lbl.configure(text=TRIM_HINT)
-        if env is not None and len(env) > 1:
-            self.env["A"] = env
-            self.redraw_timeline()
+        else:
+            self.prog_lbl.configure(text="")
+        if not self._font_warned:
+            self._show_denoise_state()
+
+    # -- 노이즈 제거 ---------------------------------------------------------
+
+    def denoise_profile(self):
+        """
+        지금 곡 구간에 쓸 노이즈 제거 설정 {'start', 'len', 'db', 'level'}.
+        꺼져 있거나, 파형이 아직 없거나, 믿을 만한 표본이 없으면 None.
+        """
+        level = self.var_denoise.get()
+        if level not in DENOISE_LEVELS or not self.ready:
+            return None
+        cam = self.audio_cam()
+        info, env = self.info[cam], self.env[cam]
+        if env is None or not info.has_audio:
+            return None
+        off = self.offset if cam == "B" else 0.0
+        key = (info.path, round(self.trim_start + off, 2), round(self.trim_end + off, 2))
+        if not self._noise_cache or self._noise_cache[0] != key:
+            found = None
+            win = find_noise_window(env, self.hop_sec, key[1], key[2], self.np)
+            if win:
+                db = measure_db(self.ff, info.path, win[0], win[1], self.np)
+                if db is not None:
+                    found = {"start": win[0], "len": win[1], "db": db}
+            self._noise_cache = (key, found)
+        return dict(self._noise_cache[1], level=level) if self._noise_cache[1] else None
+
+    def _show_denoise_state(self):
+        """노이즈 제거가 켜져 있으면 지금 상태(표본 위치, 또는 못 하는 이유)를 상태줄에 띄운다."""
+        if self.var_denoise.get() == DENOISE_OFF or not self.ready:
+            return
+        cam = self.audio_cam()
+        if not self.info[cam].has_audio:
+            text = "이 영상에는 소리가 없어 노이즈 제거를 할 수 없습니다."
+        elif self.env[cam] is None:
+            return                    # 분석 중 — 끝나면 _on_wave 에서 다시 부른다
+        else:
+            dn = self.denoise_profile()
+            text = ("노이즈 표본: %s 부터 %.1f초 (%.0fdB). 재생하면 줄어든 소리를 미리 들을 수 있습니다."
+                    % (fmt_time(dn["start"]), dn["len"], dn["db"])) if dn else \
+                ("노이즈를 잴 조용한 구간을 찾지 못했습니다. 곡 앞이나 뒤에 연주 없는 부분이 "
+                 "0.5초 이상 있어야 합니다.")
+        self.prog_lbl.configure(text=text)
+
+    def on_denoise(self):
+        """강도나 소리 카메라를 바꿨을 때. 재생 중이면 바로 비교해 들을 수 있게 그 자리에서 다시 튼다."""
+        if self.var_denoise.get() != DENOISE_OFF and self.ready:
+            cam = self.audio_cam()
+            if self.env[cam] is None and self.info[cam].has_audio:
+                self._start_wave(cam)
+            self._show_denoise_state()
+        if self._playing:
+            at = self.playhead
+            self.stop_play()
+            self.seek(at)
+            self.start_play()
+        self.update_ui()
+
+    def _denoise_text(self):
+        level = self.var_denoise.get()
+        return "" if level == DENOISE_OFF else " · 노이즈 제거 %s" % level
 
     # -- 싱크 ---------------------------------------------------------------
 
@@ -3216,7 +3439,7 @@ class App(tk.Tk):
         audio = None
         if self.info[acam].has_audio:
             aoff = self.offset if acam == "B" else 0.0
-            audio = (self.info[acam].path, t0 + aoff)
+            audio = (self.info[acam].path, t0 + aoff, self.denoise_profile())
 
         sources = {"A": (self.info["A"].path, t0)}
         if not self.single:
@@ -3241,6 +3464,10 @@ class App(tk.Tk):
             self.prog_lbl.configure(text="재생 중 — I / O 키로 바로 곡 시작과 끝을 찍을 수 있습니다.")
         else:
             self.prog_lbl.configure(text="재생 중 — 1/2 키로 바로 전환점을 찍을 수 있습니다.")
+        if audio and self._player.audio is not None and self.var_denoise.get() != DENOISE_OFF:
+            self.prog_lbl.configure(
+                text=self.prog_lbl.cget("text") + ("   (노이즈 제거 %s)" % audio[2]["level"] if audio[2]
+                                                   else "   (노이즈 제거 안 됨)"))
         self._play_after = self.after(20, self._tick_play)
 
     def stop_play(self):
@@ -3740,8 +3967,8 @@ class App(tk.Tk):
             if fi > 0 or fo > 0:
                 extra += " · 페이드 %.1f/%.1f초" % (fi, fo)
             self.est_lbl.configure(
-                text="길이 %s · %dx%d @ %.2ffps%s"
-                     % (fmt_time(total), w, h, self.out_fps()[1], extra))
+                text="길이 %s · %dx%d @ %.2ffps%s%s"
+                     % (fmt_time(total), w, h, self.out_fps()[1], extra, self._denoise_text()))
         elif ok:
             lo, hi = self.overlap()
             self.trim_lbl.configure(
@@ -3760,8 +3987,9 @@ class App(tk.Tk):
             if fi > 0 or fo > 0:
                 extra += " · 페이드 %.1f/%.1f초" % (fi, fo)
             self.est_lbl.configure(
-                text="장면 %d개 · 길이 %s · %dx%d @ %.2ffps%s"
-                     % (len(segs), fmt_time(total), w, h, self.out_fps()[1], extra))
+                text="장면 %d개 · 길이 %s · %dx%d @ %.2ffps%s%s"
+                     % (len(segs), fmt_time(total), w, h, self.out_fps()[1], extra,
+                        self._denoise_text()))
         else:
             self.trim_lbl.configure(text="")
             self.est_lbl.configure(text="")
@@ -3780,6 +4008,17 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, "이 영상에는 소리가 없습니다." if self.single
                                  else "카메라 %s 영상에는 소리가 없습니다." % acam)
             return
+
+        dn = self.denoise_profile()
+        if self.var_denoise.get() != DENOISE_OFF and not dn:
+            if self.env[acam] is None:
+                self._start_wave(acam)
+                messagebox.showinfo(APP_TITLE, "노이즈를 재려고 소리를 분석하는 중입니다.\n"
+                                               "분석이 끝나면 다시 눌러 주세요.")
+                return
+            if not messagebox.askyesno(APP_TITLE, "노이즈를 잴 조용한 구간을 찾지 못했습니다.\n\n"
+                                                  "노이즈 제거 없이 영상을 만들까요?"):
+                return
 
         default = "합본_%s.mp4" % time.strftime("%m%d_%H%M")
         iv = self.intro_settings()
@@ -3815,7 +4054,7 @@ class App(tk.Tk):
                           fade_in=fi, fade_out=fo,
                           trans_mode=tmode, trans_sec=tsec,
                           adjust=self.adjust_all(), sizes=self.cam_sizes(),
-                          intro=iv)
+                          intro=iv, denoise=dn)
 
         self._export = ExportJob(
             self.ff, plan,
@@ -3855,7 +4094,6 @@ class App(tk.Tk):
             filetypes=[("멀티캠 프로젝트", "*.mcp")])
         if not path:
             return
-        face = self._font_map.get(self.var_font.get())
         data = {
             "version": VERSION,
             "mode": self.mode,
@@ -3875,8 +4113,11 @@ class App(tk.Tk):
                       "title": self.var_title.get(),
                       "composer": self.var_composer.get(),
                       "sec": self._fnum(self.var_intro_sec, INTRO_SEC),
-                      "font": ([self.var_font.get()] + list(face)) if face else None,
-                      "title_size": self._fnum(self.var_title_size, 100.0)},
+                      "font": self._font_record(self.var_font),
+                      "title_size": self._fnum(self.var_title_size, 100.0),
+                      "composer_font": self._font_record(self.var_composer_font),
+                      "composer_size": self._fnum(self.var_composer_size, 100.0)},
+            "denoise": self.var_denoise.get(),
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3940,17 +4181,26 @@ class App(tk.Tk):
             self.var_composer.set(iv.get("composer", ""))
             self.var_intro_sec.set("%.1f" % float(iv.get("sec", INTRO_SEC)))
             self.var_title_size.set("%g" % float(iv.get("title_size", 100.0)))
-            font_ok = self._restore_font(iv.get("font"))
+            self.var_composer_size.set("%g" % float(iv.get("composer_size", 100.0)))
+            lost = [saved[0] for var, saved in ((self.var_font, iv.get("font")),
+                                                (self.var_composer_font, iv.get("composer_font")))
+                    if not self._restore_font(var, saved)]
+            level = data.get("denoise", DENOISE_OFF)
+            self.var_denoise.set(level if level in DENOISE_LABELS else DENOISE_OFF)
             self.env = {"A": None, "B": None}
             if self.single:
                 self._start_wave()
+            if self.var_denoise.get() != DENOISE_OFF and self.audio_cam() != "A":
+                self._start_wave(self.audio_cam())
+            elif self.var_denoise.get() != DENOISE_OFF and not self.single:
+                self._start_wave("A")
             self.refresh_cutlist()
             self.seek(self.trim_start)
             self.update_ui()
             self.prog_lbl.configure(text="프로젝트 불러옴: " + os.path.basename(path))
-            if not font_ok:           # 상태줄은 파형 분석 문구에 곧 덮이므로 대화상자로 알린다
+            if lost:                  # 상태줄은 파형 분석 문구에 곧 덮이므로 대화상자로 알린다
                 messagebox.showwarning(APP_TITLE, "저장된 글꼴을 찾을 수 없어 기본 글꼴로 바꿨습니다:\n"
-                                       + str(iv["font"][0]))
+                                       + "\n".join(lost))
         except Exception as e:
             messagebox.showerror(APP_TITLE, "불러오기 실패:\n" + str(e))
 
@@ -3970,9 +4220,9 @@ class App(tk.Tk):
         elif kind == "match":
             self._on_match_done(msg[1], msg[2], msg[3], msg[4])
         elif kind == "wave_prog":
-            self._on_wave_prog(msg[1], msg[2])
+            self._on_wave_prog(msg[1], msg[2], msg[3])
         elif kind == "wave":
-            self._on_wave(msg[1], msg[2])
+            self._on_wave(msg[1], msg[2], msg[3])
         elif kind == "fonts":
             self._on_fonts(msg[1])
 
@@ -4398,7 +4648,8 @@ def selftest():
                               320, 180, "30", 30.0, vargs, "A", out,
                               tmpdir=os.path.join(work, "tmp"), fade_in=0.5, fade_out=0.5,
                               intro={"title": "테스트: '곡' 100%", "composer": "작곡가", "sec": 2.0,
-                                     "font": kr_face, "scale": 1.2})
+                                     "font": kr_face, "scale": 1.2,
+                                     "composer_font": kr_face, "composer_scale": 1.3})
             result = []
             ExportJob(ff_, real, lambda f, m: None,
                       lambda good, msg: result.append((good, msg)))._run()
@@ -4449,13 +4700,18 @@ def selftest():
                 wave_index(1, 1000, 0.0, 60.0, w_hop) == 0 and
                 abs(wave_index(999, 1000, 0.0, 60.0, w_hop) - 6000) <= 1)
 
-    # 11) 곡 제목 글꼴과 크기
-    p_font = solo_plan(solo, 12.0, 102.0, dict(iv, font=("x.ttf", 2), scale=1.5))
+    # 11) 곡 제목·작곡가 글꼴과 크기
+    p_font = solo_plan(solo, 12.0, 102.0, dict(iv, font=("x.ttf", 2), scale=1.5,
+                                               composer_font=("y.ttf", 1), composer_scale=0.8))
     ok &= check("계획에 곡 제목 글꼴과 크기가 실림",
                 p_font["segments"][0]["title_font"] == ("x.ttf", 2) and
                 p_font["segments"][0]["title_scale"] == 1.5)
+    ok &= check("계획에 작곡가 글꼴과 크기가 따로 실림",
+                p_font["segments"][0]["composer_font"] == ("y.ttf", 1) and
+                p_font["segments"][0]["composer_scale"] == 0.8)
     ok &= check("인트로 뒤 본편에는 글꼴 정보가 없어도 됨",
-                "title_font" not in p_font["segments"][1])
+                "title_font" not in p_font["segments"][1] and
+                "composer_font" not in p_font["segments"][1])
 
     def layer_bytes(*args):
         return render_intro_layer(*args).tobytes()
@@ -4469,8 +4725,18 @@ def selftest():
                 "%d -> %d픽셀" % (s1[2] - s1[0], s2[2] - s2[0]))
     s3 = letters_box(1280, 720, "아주 긴 곡 제목 " * 12, "", None, 3.0)
     ok &= check("크게 키워도 화면 폭을 넘지 않음", s3[0] > 0 and s3[2] < 1280, str(s3))
-    ok &= check("크기는 작곡가에 영향 없음",
+    ok &= check("곡 제목 크기는 작곡가에 영향 없음",
                 layer_bytes(640, 360, "", "작곡가", None, 2.0) == layer_bytes(640, 360, "", "작곡가"))
+    s4 = letters_box(1280, 720, "", "Composer")
+    s5 = letters_box(1280, 720, "", "Composer", None, 1.0, None, 1.5)
+    ok &= check("작곡가 크기를 따로 키울 수 있음", (s5[2] - s5[0]) > (s4[2] - s4[0]) * 1.3,
+                "%d -> %d픽셀" % (s4[2] - s4[0], s5[2] - s5[0]))
+    ok &= check("작곡가 크기는 곡 제목에 영향 없음",
+                layer_bytes(640, 360, "Title", "", None, 1.0, None, 2.0) ==
+                layer_bytes(640, 360, "Title", ""))
+    ok &= check("작곡가 글꼴 파일이 없으면 기본 글꼴로 그림",
+                layer_bytes(640, 360, "", "작곡가", None, 1.0, ("없는파일.ttf", 0)) ==
+                layer_bytes(640, 360, "", "작곡가"))
 
     win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
     malgun, arial = os.path.join(win, "malgun.ttf"), os.path.join(win, "arial.ttf")
@@ -4495,11 +4761,156 @@ def selftest():
         ok &= check("한글 제목에 영문 글꼴을 고르면 기본 글꼴로 그림 (네모 방지)",
                     layer_bytes(640, 360, "곡 제목", "", (arial, 0)) ==
                     layer_bytes(640, 360, "곡 제목", ""))
-        ok &= check("작곡가는 고른 글꼴의 영향을 받지 않음",
+        ok &= check("곡 제목 글꼴은 작곡가에 영향 없음",
                     layer_bytes(640, 360, "", "작곡가", (arial, 0)) ==
                     layer_bytes(640, 360, "", "작곡가"))
+        ok &= check("작곡가 글꼴은 곡 제목에 영향 없음",
+                    layer_bytes(640, 360, "Title", "", None, 1.0, (arial, 0)) ==
+                    layer_bytes(640, 360, "Title", ""))
+        ok &= check("영문 작곡가는 고른 글꼴로 그림",
+                    layer_bytes(640, 360, "", "Composer", None, 1.0, (arial, 0)) !=
+                    layer_bytes(640, 360, "", "Composer"))
+        ok &= check("한글 작곡가에 영문 글꼴을 고르면 기본 글꼴로 그림",
+                    layer_bytes(640, 360, "", "작곡가", None, 1.0, (arial, 0)) ==
+                    layer_bytes(640, 360, "", "작곡가"))
+        ok &= check("글자가 없는 쪽만 기본 글꼴로 돌아감",
+                    layer_bytes(640, 360, "Title", "작곡가", (arial, 0), 1.0, (arial, 0)) ==
+                    layer_bytes(640, 360, "Title", "작곡가", (arial, 0)))
     else:
-        print("  건너뜀  곡 제목 글꼴 (윈도우 기본 글꼴 없음)")
+        print("  건너뜀  곡 제목·작곡가 글꼴 (윈도우 기본 글꼴 없음)")
+
+    # 12) 노이즈 제거 — 표본 찾기
+    n_hop = 0.01
+    n_env = np.full(6000, 0.3)                 # 60초 전체가 일단 연주
+    n_env[:800] = 0.01                         # 0~8초 조용한 앞부분
+    n_env[300:500] = 0.002                     # 그중 3~5초가 가장 조용함
+    n_env[5200:] = 0.02                        # 52초부터 조용한 뒷부분
+    ok &= check("잘라 낸 앞뒤에서 가장 조용한 곳을 고름",
+                find_noise_window(n_env, n_hop, 8.0, 52.0, np) == (3.0, 1.5),
+                str(find_noise_window(n_env, n_hop, 8.0, 52.0, np)))
+    n_back = np.full(6000, 0.3)
+    n_back[5200:] = 0.01
+    n_win = find_noise_window(n_back, n_hop, 0.0, 52.0, np)
+    ok &= check("앞이 없으면 뒤에서 찾음", n_win is not None and n_win[0] >= 52.0, str(n_win))
+    ok &= check("곡 구간 안의 쉼보다 잘라 낸 구간을 먼저 봄",
+                find_noise_window(np.where(np.arange(6000) // 1000 == 3, 0.001, n_env), n_hop,
+                                  8.0, 52.0, np) == (3.0, 1.5))
+    n_short = np.full(6000, 0.3)
+    n_short[:100] = 0.01
+    n_win = find_noise_window(n_short, n_hop, 1.0, 60.0, np)
+    ok &= check("잘라 낸 부분이 1.5초보다 짧으면 그만큼만 씀",
+                n_win is not None and abs(n_win[1] - 1.0) < 1e-9, str(n_win))
+    n_flat = np.full(6000, 0.3) + np.sin(np.arange(6000) / 50.0) * 0.1
+    ok &= check("계속 연주만 있으면 표본 없음 (음악을 노이즈로 배우지 않음)",
+                find_noise_window(n_flat, n_hop, 0.0, 60.0, np) is None)
+    ok &= check("잘라 낸 부분이 곡과 크기가 비슷하면 표본 없음",
+                find_noise_window(np.full(6000, 0.3), n_hop, 8.0, 52.0, np) is None)
+    n_zero = np.full(6000, 0.3)
+    n_zero[:800] = 0.0
+    ok &= check("디지털 무음은 노이즈 표본으로 쓰지 않음",
+                find_noise_window(n_zero, n_hop, 8.0, 60.0, np) is None)
+    n_pause = np.full(6000, 0.3)
+    n_pause[2000:2300] = 0.005
+    n_win = find_noise_window(n_pause, n_hop, 0.0, 60.0, np)
+    ok &= check("잘라 낸 부분이 없으면 곡 안의 확실한 쉼을 씀",
+                n_win is not None and 20.0 <= n_win[0] <= 21.5, str(n_win))
+    n_soft = np.full(6000, 0.3)
+    n_soft[2000:2300] = 0.1
+    ok &= check("곡 안의 잔잔한 연주는 표본으로 쓰지 않음",
+                find_noise_window(n_soft, n_hop, 0.0, 60.0, np) is None)
+    ok &= check("다른 카메라 기준으로 음수 시각이 들어와도 동작",
+                find_noise_window(n_env, n_hop, -3.0, 52.0, np) is not None)
+
+    n_dn = {"start": 2.0, "len": 1.5, "db": -40.0, "level": "중"}
+    n_plan = solo_plan(solo, 12.0, 102.0, None)
+    ok &= check("노이즈 제거를 안 고르면 계획에 없음", "denoise" not in n_plan)
+    n_plan = build_plan(solo, "a.mp4", None, 0.0, 12.0, 102.0, 640, 360, "30", 30.0, [], "A",
+                        "o.mp4", tmpdir="t", denoise=n_dn)
+    ok &= check("계획에 노이즈 제거가 실림", n_plan["denoise"] == n_dn)
+    n_g = denoise_graph(1, n_dn, "afade=t=in:st=0:d=1")
+    ok &= check("그래프: 표본을 앞에 이어 붙이고 배운 뒤 잘라 냄",
+                n_g.index("atrim=end") < n_g.index("concat") < n_g.index("sn start") <
+                n_g.index("sn stop") < n_g.index("afftdn=nr") < n_g.index("atrim=start") <
+                n_g.index("afade"), n_g[:60])
+    ok &= check("그래프: 표본을 정확한 길이로 자름", "atrim=end=1.500000" in n_g)
+    ok &= check("그래프: 필터 지연까지 잘라 냄", "atrim=start=%.6f" % (1.5 + DENOISE_DELAY) in n_g)
+    ok &= check("그래프: 강도별 기준값",
+                "nf=-35.0" in n_g and
+                "nf=-40.0" in denoise_graph(0, dict(n_dn, level="약")))
+    ok &= check("그래프: 기준값은 허용 범위 안으로",
+                "nf=-20.0" in denoise_graph(0, dict(n_dn, db=-5.0)) and
+                "nf=-80.0" in denoise_graph(0, dict(n_dn, db=-99.0, level="약")))
+
+    # 13) 노이즈 제거 실제 변환 — 줄어드는지, 소리가 다치지 않는지, 영상과 어긋나지 않는지
+    if ff_ and fp_:
+        import tempfile
+        work = tempfile.mkdtemp(prefix="multicam_test_")
+        try:
+            src = os.path.join(work, "src.mp4")
+            noise = "0.02*(2*random(%d)-1)"
+            pulses = ("if(gt(t,3),if(lt(mod(t,0.37),0.03),0.45,0)+if(lt(mod(t,0.53),0.03),0.3,0),0)"
+                      "*sin(2*PI*1000*t)")
+            subprocess.run([ff_, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=9",
+                            "-f", "lavfi", "-i", "aevalsrc='%s+%s|%s+%s':s=48000:d=9"
+                            % (noise % 0, pulses, noise % 1, pulses),
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "256k", src], capture_output=True, **_hidden_kwargs())
+            env_n = load_envelope(ff_, src, np)
+            win = find_noise_window(env_n, HOP / float(SR), 3.0, 8.5, np)
+            ok &= check("실제 소리에서 곡 앞 노이즈 구간을 찾음",
+                        win is not None and win[0] + win[1] <= 3.0, str(win))
+            db_n = measure_db(ff_, src, win[0], win[1], np) if win else None
+            ok &= check("노이즈 크기를 잼 (약 -39dB)", db_n is not None and -42 < db_n < -36,
+                        "%.1fdB" % (db_n if db_n is not None else 0.0))
+            if win and db_n is not None:
+                vargs = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"]
+                out = os.path.join(work, "out.mp4")
+                real = build_plan(compute_segments(3.0, 8.5, [], "A"), src, None, 0.0, 3.0, 8.5,
+                                  320, 180, "30", 30.0, vargs, "A", out,
+                                  tmpdir=os.path.join(work, "tmp"),
+                                  denoise={"start": win[0], "len": win[1], "db": db_n, "level": "중"})
+                result = []
+                ExportJob(ff_, real, lambda f, m: None,
+                          lambda good, msg: result.append((good, msg)))._run()
+                ok &= check("노이즈 제거 넣은 영상 변환 성공", bool(result) and result[0][0],
+                            "" if result and result[0][0] else str(result)[:300])
+                if result and result[0][0]:
+                    a_in = load_raw(ff_, src, 3.0, 5.5, np, sr=8000)
+                    # 처음부터 읽을 때 -ss 0 을 주면 첫 프레임(21ms)이 빠져 어긋나 보인다
+                    a_out = load_raw(ff_, out, None, 5.5, np, sr=8000)
+                    n_cmp = min(len(a_in), len(a_out))
+                    ok &= check("소리 길이 그대로 (5.5초)", abs(n_cmp / 8000.0 - 5.5) < 0.05,
+                                "%.3f초" % (n_cmp / 8000.0))
+                    a_in, a_out = a_in[:n_cmp], a_out[:n_cmp]
+                    lag_n, _ = _xcorr_lag(_norm(a_in, np), _norm(a_out, np), np, phat=False,
+                                          guard=80)
+                    ok &= check("영상과 소리가 어긋나지 않음 (2ms 이내)", abs(lag_n) <= 16,
+                                "%.2fms" % (lag_n / 8.0))
+
+                    def rms_db(x):
+                        return 20 * math.log10(float(np.sqrt(np.mean(x * x))) + 1e-12)
+
+                    # 40ms 칸으로 나눠 조용한 칸(노이즈만)과 큰 칸(연주)을 따로 잰다
+                    frame = 320
+                    cut = (n_cmp // frame) * frame
+                    power = (a_in[:cut].reshape(-1, frame) ** 2).mean(axis=1)
+                    quiet_f = power < np.percentile(power, 15)
+                    loud_f = power > np.percentile(power, 85)
+                    q_in = a_in[:cut].reshape(-1, frame)[quiet_f].ravel()
+                    q_out = a_out[:cut].reshape(-1, frame)[quiet_f].ravel()
+                    l_in = a_in[:cut].reshape(-1, frame)[loud_f].ravel()
+                    l_out = a_out[:cut].reshape(-1, frame)[loud_f].ravel()
+                    ok &= check("연주 없는 부분의 노이즈가 줄어듦 (5dB 이상)",
+                                rms_db(q_out) - rms_db(q_in) < -5.0,
+                                "%+.1fdB" % (rms_db(q_out) - rms_db(q_in)))
+                    ok &= check("연주 소리 크기는 거의 그대로 (1dB 이내)",
+                                abs(rms_db(l_out) - rms_db(l_in)) < 1.0,
+                                "%+.2fdB" % (rms_db(l_out) - rms_db(l_in)))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    else:
+        print("  건너뜀  노이즈 제거 실제 변환 (ffmpeg 없음)")
 
     print("\n자체 점검:", "전체 통과" if ok else "실패 있음")
     return 0 if ok else 1
